@@ -265,6 +265,18 @@ vóór `./buildconf`, tarball `php-7.4.34.tar.gz` in `cache/`, regel
 `./build php_expert 7.4 php-fpm`). Op Debian 12 zijn de bouwtools gewoon
 `apt-get install -y autoconf bison re2c`.
 
+**PHP 8.0** idem met de branch `PHP-8.0-CVE-2026-109618-109619`: daar staat
+`AC_INIT` nog op 8.0.30 (hetzelfde nummer als de officiële laatste release),
+dus `sed -i 's/\[8\.0\.30\]/[8.0.31]/' configure.ac` vóór `./buildconf`,
+tarball `php-8.0.31.tar.gz` in `cache/`, regel `php80:8.0.31:<md5>` in
+`custom_versions.txt`, daarna `./build php_expert 8.0 php-fpm`. Meerdere
+versies kun je in één `custom_versions.txt` zetten (één regel per versie) en
+achter elkaar bouwen met `nohup sh -c './build php_expert 7.4 php-fpm && ./build php_expert 8.0 php-fpm' > /root/php-builds.log 2>&1 &`.
+
+Welke site op welke versie draait zie je in DirectAdmin per domein in
+`/usr/local/directadmin/data/users/*/domains/*.conf` (`php1_select=1..4`
+verwijst naar `php1_release` t/m `php4_release` in `options.conf`).
+
 `custom_versions.txt` wordt door `./build update` niet overschreven; haal het
 weer weg zodra je naar een ondersteunde versie migreert.
 
