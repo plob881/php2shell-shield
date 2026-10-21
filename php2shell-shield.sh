@@ -44,7 +44,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -918,13 +918,25 @@ php_reload_all() {
   if [ "$HAVE_OLS" = 1 ] || [ "$HAVE_LSWS" = 1 ]; then lsws_restart; ok "LiteSpeed herstart (lsphp leest php.ini opnieuw)"; fi
 }
 
+# bevat de binary de functie zend_mm_safe_error_ex (toegevoegd door de backport-commit
+# "Avoid state corruption via bailout" voor 7.4, 8.0 en 8.1)? ZEND_API, dus zichtbaar via nm -D
+has_backport_symbol() {
+  local b="$1"
+  if command -v nm >/dev/null 2>&1 && nm -D "$b" 2>/dev/null | grep -q zend_mm_safe_error_ex; then return 0; fi
+  grep -aq zend_mm_safe_error_ex "$b" 2>/dev/null   # werkt ook zonder binutils
+}
+
 # vergelijk versie: fixed_status VERSIE -> OK | ONGEPATCHT | EOL | ONBEKEND
 fixed_status() {
   local v="$1" major minor patch fx fmaj fmin fpat
   [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || { echo ONBEKEND; return; }
   major=${BASH_REMATCH[1]}; minor=${BASH_REMATCH[2]}; patch=${BASH_REMATCH[3]}
-  # de officiële backport-branch van het PHP-securityteam voor 8.1 meldt zich als 8.1.34
-  if [ "$major" -eq 8 ] && [ "$minor" -eq 1 ] && [ "$patch" -ge 34 ]; then echo "OK (backport)"; return; fi
+  # zelf gebouwde backports met een versienummer dat nooit officieel is uitgebracht
+  # (7.4.34+, 8.0.31+, 8.1.35+); 8.1.34 is óók de officiële dec-2025 release en bewijst niets,
+  # daarom controleert php_report EOL-binaries ook op het fix-symbool zend_mm_safe_error_ex
+  if { [ "$major" -eq 7 ] && [ "$minor" -eq 4 ] && [ "$patch" -ge 34 ]; } \
+     || { [ "$major" -eq 8 ] && [ "$minor" -eq 0 ] && [ "$patch" -ge 31 ]; } \
+     || { [ "$major" -eq 8 ] && [ "$minor" -eq 1 ] && [ "$patch" -ge 35 ]; }; then echo "OK (backport)"; return; fi
   if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 2 ]; }; then echo EOL; return; fi
   IFS=',' read -ra _fx <<< "$FIXED_VERSIONS"
   for fx in "${_fx[@]}"; do
@@ -944,6 +956,8 @@ php_report() {
     ver=$("$b" -v 2>/dev/null | head -1 | awk '{print $2}')
     up=$("$b" -i 2>/dev/null | awk -F'=> ' '/^session.upload_progress.enabled/{gsub(/[[:space:]]/,"",$2); print $2; exit}')
     st=$(fixed_status "${ver:-0}")
+    # EOL-binary die het fix-symbool van de officiële backport-commit bevat = toch gepatcht
+    if [ "$st" = EOL ] && has_backport_symbol "$b"; then st="OK (backport, symbool aanwezig)"; fi
     printf '  %-52s %-10s upload_progress=%-6s %s\n' "$b" "${ver:-?}" "${up:-?}" "$st"
   done
   say "  (EOL = geen fix van php.net; alleen veilig met een vendor-backport (DirectAdmin CustomBuild, Plesk, distributie)"

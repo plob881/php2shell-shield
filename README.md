@@ -251,6 +251,20 @@ De officiële laatste 8.1-release heet óók 8.1.34 (18 december 2025); de
 backport-branch is die release plus één commit van 18 oktober 2026 met de
 fixes voor beide CVE's ("Avoid state corruption via bailout", onder meer de
 nieuwe functie `zend_mm_safe_error_ex` en de upload-progress-route hard uit).
+Geef je eigen build daarom liever een versienummer dat nooit officieel is
+uitgebracht: pas vóór `./buildconf` de `AC_INIT`-regel in `configure.ac` aan
+(bijvoorbeeld 8.1.35) en noem tarball en map daarnaar. `status` beoordeelt
+7.4.34+, 8.0.31+ en 8.1.35+ als "OK (backport)" en controleert EOL-binaries
+bovendien op het fix-symbool met `nm -D`.
+
+**PHP 7.4** gaat op dezelfde manier met de branch
+`PHP-7.4-CVE-2026-109618-109619` (7.4.33 plus de fix; `configure.ac` zegt
+daar al 7.4.34-dev, dus `sed -i 's/\[7\.4\.34-dev\]/[7.4.34]/' configure.ac`
+vóór `./buildconf`, tarball `php-7.4.34.tar.gz` in `cache/`, regel
+`php74:7.4.34:<md5>` in `custom_versions.txt`, daarna
+`./build php_expert 7.4 php-fpm`). Op Debian 12 zijn de bouwtools gewoon
+`apt-get install -y autoconf bison re2c`.
+
 `custom_versions.txt` wordt door `./build update` niet overschreven; haal het
 weer weg zodra je naar een ondersteunde versie migreert.
 
