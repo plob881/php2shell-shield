@@ -42,7 +42,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -394,7 +394,7 @@ EOF
 apache_server_conf() {
   local reqfn="$1" with_log="$2" e
   e=$(apache_expr "$reqfn")
-  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=$(trust_summary)"
+  echo "# php2shell-shield - mode=$MODE - scope=$SCOPE - trust=$(trust_summary)"
   echo "# Globale Apache-maatregel tegen CVE-2026-109618 / CVE-2026-109619."
   echo "# Verwijderen: php2shell-shield uninstall"
   if [ "$MODE" != signature ]; then
@@ -426,7 +426,7 @@ EOF
 # Apache, vhost-context (fallback/LiteSpeed Enterprise): geen GlobalLog
 apache_vhost_conf() {
   local reqfn="$1" e
-  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=$(trust_summary) - vhost-variant"
+  echo "# php2shell-shield - mode=$MODE - scope=$SCOPE - trust=$(trust_summary) - vhost-variant"
   if [ "$HAVE_LSWS" = 1 ] || [ "$DA_WEBSERVER" = litespeed ]; then
     rewrite_rules
     return
@@ -477,7 +477,7 @@ rewrite_rules() {
 # nginx, http-context
 nginx_http_conf() {
   local c
-  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=$(trust_summary) - http-context"
+  echo "# php2shell-shield - mode=$MODE - scope=$SCOPE - trust=$(trust_summary) - http-context"
   echo "geo \$php2shell_trusted {"
   echo "    default 0;"
   while read -r c; do [ -n "$c" ] && echo "    $c 1;"; done < <(trust_list)
@@ -498,7 +498,7 @@ EOF
 
 # nginx, server-context (wordt in elk server{}-blok ingesloten)
 nginx_server_conf() {
-  echo "# php2shell-shield v$VERSION - mode=$MODE - server-context"
+  echo "# php2shell-shield - mode=$MODE - server-context"
   if [ "$MODE" = strict ]; then
     printf 'if ($php2shell_block) {\n    return 403;\n}\n'
   fi
@@ -822,7 +822,7 @@ set_ini_directive() {
 }
 
 php_dropin_content() {
-  echo "; php2shell-shield v$VERSION - noodmaatregel CVE-2026-109618 / CVE-2026-109619"
+  echo "; php2shell-shield - noodmaatregel CVE-2026-109618 / CVE-2026-109619"
   echo "; session upload-progress is de tot nu toe bekende aanvalsroute; uitzetten kost niets."
   echo "session.upload_progress.enabled = Off"
   [ "$STRICT_SESSIONS" = 1 ] && echo "session.use_strict_mode = 1"
@@ -1067,6 +1067,11 @@ test_hosts() {
   esac
   hostname -f 2>/dev/null
 }
+# IP's om lokaal mee te testen: eerst de echte interface-adressen (daar luisteren
+# de vhosts op), loopback als laatste (dat komt bij DirectAdmin op de hoofdserver uit)
+probe_ips() {
+  { hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; echo 127.0.0.1; } | awk '!seen[$0]++'
+}
 listen_ports() {   # poorten van apache/nginx/lsws, zonder paneel-/adminpoorten
   ss -ltnp 2>/dev/null | grep -E 'httpd|apache2|nginx|litespeed|lshttpd|openlitespeed' | awk '{print $4}' | sed 's/.*://' \
     | grep -vxE '2222|2083|2087|2096|7080|7081|8443|8880' | sort -un
@@ -1078,7 +1083,7 @@ do_test() {
   hr; say "Zelftest: multipart-POST moet 403 geven, gewone GET niet (redirects worden gevolgd, op de server zelf)"
   hosts=$(test_hosts | sort -u)
   port_list=$(listen_ports); [ -n "$port_list" ] || port_list="80 443"
-  ips="127.0.0.1 $(hostname -I 2>/dev/null | awk '{print $1}')"
+  ips=$(probe_ips)
   for h in $hosts; do
     for p in $port_list; do
       case "$p" in 443|8081) scheme=https ;; *) scheme=http ;; esac
@@ -1113,26 +1118,40 @@ do_test() {
 # --probe DOMEIN : plaats tijdelijk een PHP-bestand in de docroot en lees de
 # effectieve waarde van session.upload_progress.enabled via HTTP
 do_probe() {
-  local dom="$1" user docroot f name out scheme
+  local dom="$1" user docroots="" d f name out scheme ip
   case "$PANEL" in
-    directadmin) user=$(awk -F': ' -v d="$dom" '$1==d{print $2}' /etc/virtual/domainowners); docroot="/home/$user/domains/$dom/public_html" ;;
-    plesk)       docroot="/var/www/vhosts/$dom/httpdocs" ;;
-    cpanel)      user=$(awk -F': ' -v d="$dom" '$1==d{print $2}' /etc/userdomains); docroot="/home/$user/public_html" ;;
+    directadmin)
+      user=$(awk -F': ' -v d="$dom" '$1==d{print $2}' /etc/virtual/domainowners)
+      docroots="/home/$user/domains/$dom/public_html"
+      # DirectAdmin gebruikt voor https private_html; alleen apart als het geen symlink is
+      [ -d "/home/$user/domains/$dom/private_html" ] && [ ! -L "/home/$user/domains/$dom/private_html" ] && docroots="$docroots /home/$user/domains/$dom/private_html" ;;
+    plesk)       docroots="/var/www/vhosts/$dom/httpdocs" ;;
+    cpanel)      user=$(awk -F': ' -v d="$dom" '$1==d{print $2}' /etc/userdomains); docroots="/home/$user/public_html" ;;
     *)           warn "probe: docroot onbekend voor dit paneel"; return 1 ;;
   esac
-  [ -d "$docroot" ] || { warn "probe: docroot $docroot bestaat niet"; return 1; }
+  [ -d "${docroots%% *}" ] || { warn "probe: docroot ${docroots%% *} bestaat niet"; return 1; }
   name="p2s-probe-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n').php"
-  f="$docroot/$name"
-  printf '<?php header("Content-Type: text/plain"); echo "php=", PHP_VERSION, " sapi=", PHP_SAPI, " upload_progress=", var_export(ini_get("session.upload_progress.enabled"), true), "\\n";\n' > "$f"
-  chown --reference="$docroot" "$f" 2>/dev/null
-  out=""
-  for scheme in https http; do
-    out=$(curl -sk -m 10 -L --resolve "$dom:443:127.0.0.1" --resolve "$dom:80:127.0.0.1" "$scheme://$dom/$name" 2>/dev/null | head -1)
-    case "$out" in *upload_progress=*) break ;; esac
+  for d in $docroots; do
+    f="$d/$name"
+    printf '<?php header("Content-Type: text/plain"); echo "php=", PHP_VERSION, " sapi=", PHP_SAPI, " upload_progress=", var_export(ini_get("session.upload_progress.enabled"), true), "\\n";\n' > "$f"
+    chown --reference="$d" "$f" 2>/dev/null
   done
-  rm -f "$f"
+  out=""
+  for ip in $(probe_ips); do
+    for scheme in https http; do
+      out=$(curl -sk -m 10 -L --resolve "$dom:443:$ip" --resolve "$dom:80:$ip" "$scheme://$dom/$name" 2>/dev/null | head -1)
+      case "$out" in *upload_progress=*) break 2 ;; esac
+    done
+  done
+  for d in $docroots; do rm -f "$d/$name"; done
   say "  probe $dom: ${out:-geen antwoord}"
-  printf '%s' "$out" | grep -q "upload_progress=''\|upload_progress='0'\|upload_progress=false" && ok "upload_progress staat effectief UIT voor $dom" || warn "upload_progress NIET aantoonbaar uit voor $dom (per-domein php.ini/.user.ini? handler nog niet herladen?)"
+  if printf '%s' "$out" | grep -q "upload_progress=''\|upload_progress='0'\|upload_progress=false"; then
+    ok "upload_progress staat effectief UIT voor $dom"
+  elif printf '%s' "$out" | grep -q "upload_progress="; then
+    warn "upload_progress staat nog AAN voor $dom (per-domein php.ini/.user.ini? handler nog niet herladen?)"
+  else
+    warn "probe kwam niet bij PHP van $dom uit (antwoord: ${out:-leeg}); controleer of de docroot afwijkt van de standaard"
+  fi
 }
 
 do_scan() {
