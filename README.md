@@ -212,6 +212,39 @@ De paneelpakketten lopen uren tot dagen achter op php.net.
 - **Kaal Debian/Ubuntu/RHEL:** `apt`/`dnf` zodra de distributie of Sury/Remi
   levert (Remi heeft aangekondigd niet op de releasedag te leveren).
 
+### PHP 8.1 zelf patchen met de officiële backport (DirectAdmin CustomBuild)
+
+Krijgt je server geen gepatchte 8.1 van DirectAdmin (bijvoorbeeld een legacy-
+licentie met een bevroren versielijst), dan kun je de backport-branch van het
+PHP-securityteam zelf door CustomBuild laten bouwen. Die branch meldt zich als
+**8.1.34**; `status` herkent dat als "OK (backport)". Maak eerst een snapshot
+of backup van de VM. De sites blijven draaien tijdens de build; CustomBuild
+vervangt de binaries pas als de compilatie geslaagd is.
+
+```bash
+# 1. geen half-geconfigureerde tweede PHP-versie laten staan (anders breekt rewrite_confs)
+cd /usr/local/directadmin/custombuild && ./build set php2_release no
+# 2. gereedschap voor ./buildconf (de git-branch bevat geen configure-script)
+dnf install -y autoconf bison re2c 2>/dev/null || apt-get install -y autoconf bison re2c
+# 3. backport ophalen, configure genereren, als tarball klaarzetten en de versie overrulen
+cd /usr/local/directadmin/custombuild \
+ && curl -fsSL -o php-src-backport.tar.gz https://github.com/php/php-src/archive/refs/heads/PHP-8.1-CVE-2026-109618-109619.tar.gz \
+ && rm -rf php-8.1.34 && mkdir php-8.1.34 && tar xzf php-src-backport.tar.gz -C php-8.1.34 --strip-components=1 \
+ && (cd php-8.1.34 && ./buildconf --force) && tar czf php-8.1.34.tar.gz php-8.1.34 && rm -rf php-8.1.34 php-src-backport.tar.gz \
+ && echo "php81:8.1.34:$(md5sum php-8.1.34.tar.gz | cut -d' ' -f1)" > custom_versions.txt \
+ && ./build versions | grep -A2 'PHP 8.1'          # moet 8.1.34 als nieuwste tonen
+# 4. alleen 8.1 bouwen (20-40 min); via nohup zodat een wegvallende VPN de build niet afbreekt
+nohup ./build php_expert 8.1 php-fpm > /root/php81-build.log 2>&1 &
+tail -f /root/php81-build.log
+# 5. controleren: 8.1.34 kan alleen uit jouw tarball komen
+/usr/local/php81/bin/php81 -v | head -1 && php2shell-shield status | grep php81
+```
+
+`custom_versions.txt` wordt door `./build update` niet overschreven; haal het
+weer weg zodra je naar een ondersteunde versie migreert. Dezelfde branches
+bestaan voor 7.4 en 8.0, maar die melden geen nieuw versienummer, dus daar
+kun je het resultaat niet aan `php -v` aflezen.
+
 Daarna:
 
 ```bash

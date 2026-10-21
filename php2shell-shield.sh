@@ -44,7 +44,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -906,6 +906,8 @@ fixed_status() {
   local v="$1" major minor patch fx fmaj fmin fpat
   [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || { echo ONBEKEND; return; }
   major=${BASH_REMATCH[1]}; minor=${BASH_REMATCH[2]}; patch=${BASH_REMATCH[3]}
+  # de officiële backport-branch van het PHP-securityteam voor 8.1 meldt zich als 8.1.34
+  if [ "$major" -eq 8 ] && [ "$minor" -eq 1 ] && [ "$patch" -ge 34 ]; then echo "OK (backport)"; return; fi
   if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 2 ]; }; then echo EOL; return; fi
   IFS=',' read -ra _fx <<< "$FIXED_VERSIONS"
   for fx in "${_fx[@]}"; do
@@ -928,7 +930,8 @@ php_report() {
     printf '  %-52s %-10s upload_progress=%-6s %s\n' "$b" "${ver:-?}" "${up:-?}" "$st"
   done
   say "  (EOL = geen fix van php.net; alleen veilig met een vendor-backport (DirectAdmin CustomBuild, Plesk, distributie)"
-  say "   of na migratie naar 8.2+. De blokkade dekt de door PHP gedocumenteerde routes; updaten blijft de enige volledige fix.)"
+  say "   of na migratie naar 8.2+. Zelf gebouwd uit PHP's backport-branch meldt 8.1 zich als 8.1.34 = OK (backport)."
+  say "   De blokkade dekt de door PHP gedocumenteerde routes; updaten blijft de enige volledige fix.)"
 }
 
 # =============================================================================
