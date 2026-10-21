@@ -40,10 +40,53 @@ php2shell-shield test --probe klantdomein.nl      # leest de echte PHP-instellin
 tail -f /var/log/php2shell-shield/blocked.log
 ```
 
-Met `--trust` geef je de IP's/CIDR's op (komma-gescheiden) die wél multipart
-mogen blijven sturen, bijvoorbeeld je kantoor of een monitoringsysteem. Geef
-**niet** 127.0.0.1 of het server-IP op: dan kan de zelftest de blokkade niet
-meer aantonen.
+## Vertrouwde adressen (kantoor, OpenVPN, monitoring)
+
+Vertrouwde adressen mogen multipart blijven sturen (uploads werken daar dus
+gewoon) en worden nooit gebant. Je kunt er zoveel opgeven als je wilt, als IP
+of als IP/CIDR, en de lijst is op de server zelf te beheren:
+
+```bash
+# bij install: komma-gescheiden, en --trust mag meerdere keren
+php2shell-shield install --trust 203.0.113.5,10.8.0.0/24 --trust 198.51.100.0/24
+
+# of uit een bestand (één adres per regel, # = commentaar); wordt samengevoegd in /etc/php2shell-shield/trust.txt
+php2shell-shield install --trust-file /root/trust.txt
+
+# later, zonder herinstallatie; de wijziging gaat direct live op Apache/nginx en in de watch-service
+php2shell-shield trust add 10.8.0.0/24,203.0.113.7
+php2shell-shield trust remove 203.0.113.7
+php2shell-shield trust list
+```
+
+De lijst staat in `/etc/php2shell-shield/trust.txt` en blijft bij `uninstall`
+bewaard. Geef **niet** 127.0.0.1 of het server-IP op: dan kan de zelftest de
+blokkade niet meer aantonen.
+
+**Welk adres moet erin bij OpenVPN?** Dat hangt af van het pad dat je
+webverkeer neemt; de webserver ziet maar één bron-IP:
+
+- Loopt je browserverkeer naar de sites door de tunnel (OpenVPN-server op of
+  naast de VM, `redirect-gateway` of een route naar het servernetwerk), dan
+  ziet de webserver het **VPN-clientsubnet**, bijvoorbeeld `10.8.0.0/24`.
+- Doet de VPN-gateway NAT, dan ziet de webserver het **interne of publieke
+  adres van de gateway**; neem dat ene adres op.
+- Gebruik je de VPN alleen voor SSH/het paneel en bezoek je de sites via het
+  internet, dan is het je **kantoor- of thuis-IP**.
+
+Zeker weten? Verbind via de VPN, doe een upload-poging (of een `curl -F x=1`
+naar een site op de server) en kijk welk bron-IP in
+`/var/log/php2shell-shield/blocked.log` verschijnt; dat adres voeg je toe met
+`trust add`.
+
+**Let op bij een firewall of proxy vóór de VM's.** Staat er een reverse proxy
+of load balancer die de verbinding overneemt, dan komt *al* het webverkeer
+van hetzelfde interne IP. Dat adres mag je dan nooit vertrouwen (de blokkade
+zou voor iedereen wegvallen); laat Apache/nginx dan eerst het echte client-IP
+gebruiken (`mod_remoteip` / `real_ip_header` met `X-Forwarded-For`). Gewone
+port-forwarding (DNAT) behoudt het bron-IP en is geen probleem. Interne
+reeksen (10/8, 172.16/12, 192.168/16) en Cloudflare worden sowieso nooit
+gebant.
 
 ## Ophalen vanaf GitHub (per server, zonder SFTP)
 

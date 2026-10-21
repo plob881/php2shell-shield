@@ -17,13 +17,22 @@
 #
 #  Gebruik (als root):
 #    php2shell-shield.sh install [--mode strict|monitor|signature]
-#                               [--trust IP[,IP/CIDR,...]] [--scope all|BESTAND]
+#                               [--trust IP[,IP/CIDR,...]] [--trust-file BESTAND]
+#                               [--scope all|BESTAND]
 #                               [--no-php-ini] [--no-watch] [--no-test] [--dry-run]
+#    php2shell-shield.sh trust list | add IP[,IP/CIDR,...] | remove IP | clear
+#                                           (lijst in /etc/php2shell-shield/trust.txt,
+#                                            wijzigingen gaan direct live)
 #    php2shell-shield.sh status | test [--probe DOMEIN] | scan | reapply
 #    php2shell-shield.sh eol-domains        (hostlijst met EOL-PHP voor --scope)
 #    php2shell-shield.sh uninstall [--restore-php-ini]
 #    php2shell-shield.sh watch              (wordt door systemd gestart)
 #    php2shell-shield.sh unban IP | bans
+#
+#  Vertrouwde adressen (--trust, --trust-file, trust add) mogen multipart blijven
+#  sturen en worden nooit gebant: je kantoor-IP, het OpenVPN-clientsubnet
+#  (bijv. 10.8.0.0/24) of het NAT-adres van de VPN-gateway zoals de webserver het
+#  ziet. Kijk in /var/log/php2shell-shield/blocked.log welk bron-IP jij hebt.
 #
 #  Modi:
 #    strict    : blokkeer álle multipart-verzoeken (uploads/formulieren met
@@ -33,9 +42,11 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
+TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
+TRUST_IMPORT=""                        # --trust-file: lokaal bestand dat in trust.txt wordt samengevoegd
 CREATED_LIST="$SHIELD_DIR/created-files.list"
 MODIFIED_LIST="$SHIELD_DIR/modified-files.list"
 INI_BACKUP_LIST="$SHIELD_DIR/php-ini-backups.list"
@@ -205,8 +216,12 @@ load_state() {
 }
 
 # --- IP-hulpfuncties ----------------------------------------------------------
-is_ipv4()      { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-is_ipv4_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; }
+is_ipv4() {
+  local o
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
+}
+is_ipv4_cidr() { [[ "$1" == */* ]] && is_ipv4 "${1%/*}" && [[ "${1#*/}" =~ ^([0-9]|[12][0-9]|3[0-2])$ ]]; }
 is_ipv6()      { [[ "$1" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] && [[ "$1" == *:* ]]; }
 
 ip4_to_int() { local a b c d; IFS=. read -r a b c d <<< "$1"; echo $(( (a<<24) + (b<<16) + (c<<8) + d )); }
@@ -230,21 +245,54 @@ norm_cidr() {
   else return 1; fi
 }
 
+# ruwe invoer uit --trust (komma's/spaties) en uit een bestand (# = commentaar)
+trust_raw_opts() { printf '%s' "$TRUST" | tr ', ' '\n\n' | grep -v '^$'; }
+trust_raw_file() { [ -f "$1" ] && sed 's/#.*//; s/[[:space:]]//g' "$1" | grep -v '^$'; return 0; }
+
 validate_trust() {
-  local item
-  [ -z "$TRUST" ] && return 0
-  IFS=',' read -ra _items <<< "$TRUST"
-  for item in "${_items[@]}"; do
-    item="${item// /}"; [ -z "$item" ] && continue
+  local item n=0
+  while read -r item; do
     norm_cidr "$item" >/dev/null || die "Ongeldig vertrouwd adres: '$item' (gebruik IP of IP/CIDR)"
-  done
+  done < <(trust_raw_opts)
+  while read -r item; do
+    n=$((n+1)); norm_cidr "$item" >/dev/null || die "Ongeldig adres in $TRUST_FILE: '$item'"
+  done < <(trust_raw_file "$TRUST_FILE")
+  if [ -n "$TRUST_IMPORT" ]; then
+    [ -f "$TRUST_IMPORT" ] || die "--trust-file: $TRUST_IMPORT bestaat niet"
+    while read -r item; do
+      norm_cidr "$item" >/dev/null || die "Ongeldig adres in $TRUST_IMPORT: '$item'"
+    done < <(trust_raw_file "$TRUST_IMPORT")
+  fi
 }
 
-trust_list() {   # één CIDR per regel
-  local item
-  [ -z "$TRUST" ] && return 0
-  IFS=',' read -ra _items <<< "$TRUST"
-  for item in "${_items[@]}"; do item="${item// /}"; [ -n "$item" ] && norm_cidr "$item"; done
+# effectieve lijst: --trust/state + trust.txt, genormaliseerd (CIDR) en ontdubbeld
+trust_list() {
+  { trust_raw_opts; trust_raw_file "$TRUST_FILE"; } | while read -r item; do norm_cidr "$item" || true; done | sort -u
+}
+trust_summary() { local s; s=$(trust_list | paste -sd, -); printf '%s' "${s:-geen}"; }
+
+# voeg adressen toe aan trust.txt (0 = iets toegevoegd). Args: IP's, komma- of spatiegescheiden
+trust_file_add() {
+  local item c added=1
+  mkdir -p "$SHIELD_DIR"; touch "$TRUST_FILE"
+  for item in $(printf '%s' "$*" | tr ',' ' '); do
+    c=$(norm_cidr "$item") || die "Ongeldig adres: '$item' (gebruik IP of IP/CIDR)"
+    grep -qxF "$c" "$TRUST_FILE" || { echo "$c" >> "$TRUST_FILE"; added=0; }
+  done
+  return $added
+}
+trust_file_remove() {
+  local item c tmp removed=1
+  [ -f "$TRUST_FILE" ] || return 1
+  for item in $(printf '%s' "$*" | tr ',' ' '); do
+    c=$(norm_cidr "$item") || die "Ongeldig adres: '$item'"
+    if grep -qxF "$c" "$TRUST_FILE"; then
+      tmp=$(mktemp); grep -vxF "$c" "$TRUST_FILE" > "$tmp"; cat "$tmp" > "$TRUST_FILE"; rm -f "$tmp"; removed=0
+    else
+      warn "$c staat niet in $TRUST_FILE$(printf '%s' "$TRUST" | grep -q . && printf ' (staat het in de bij install opgegeven --trust? draai dan install opnieuw met een nieuwe --trust)')"
+    fi
+  done
+  return $removed
 }
 
 # --- scope (hostlijst) --------------------------------------------------------
@@ -300,7 +348,7 @@ detect_env() {
 print_env() {
   hr
   say "Omgeving : paneel=$PANEL${DA_WEBSERVER:+ (webserver=$DA_WEBSERVER)}  apache=$HAVE_APACHE  nginx=$HAVE_NGINX  openlitespeed=$HAVE_OLS  litespeed=$HAVE_LSWS"
-  say "Instelling: mode=$MODE  scope=$SCOPE  trust=${TRUST:-geen}  php.ini=$DO_PHP_INI  watch=$DO_WATCH  dry-run=$DRY_RUN"
+  say "Instelling: mode=$MODE  scope=$SCOPE  trust=$(trust_summary)  php.ini=$DO_PHP_INI  watch=$DO_WATCH  dry-run=$DRY_RUN"
   hr
 }
 
@@ -346,7 +394,7 @@ EOF
 apache_server_conf() {
   local reqfn="$1" with_log="$2" e
   e=$(apache_expr "$reqfn")
-  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=${TRUST:-geen}"
+  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=$(trust_summary)"
   echo "# Globale Apache-maatregel tegen CVE-2026-109618 / CVE-2026-109619."
   echo "# Verwijderen: php2shell-shield uninstall"
   if [ "$MODE" != signature ]; then
@@ -378,7 +426,7 @@ EOF
 # Apache, vhost-context (fallback/LiteSpeed Enterprise): geen GlobalLog
 apache_vhost_conf() {
   local reqfn="$1" e
-  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=${TRUST:-geen} - vhost-variant"
+  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=$(trust_summary) - vhost-variant"
   if [ "$HAVE_LSWS" = 1 ] || [ "$DA_WEBSERVER" = litespeed ]; then
     rewrite_rules
     return
@@ -429,7 +477,7 @@ rewrite_rules() {
 # nginx, http-context
 nginx_http_conf() {
   local c
-  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=${TRUST:-geen} - http-context"
+  echo "# php2shell-shield v$VERSION - mode=$MODE - scope=$SCOPE - trust=$(trust_summary) - http-context"
   echo "geo \$php2shell_trusted {"
   echo "    default 0;"
   while read -r c; do [ -n "$c" ] && echo "    $c 1;"; done < <(trust_list)
@@ -1211,6 +1259,9 @@ apply_all() {
 
 do_install() {
   need_root; detect_env; validate_trust
+  if [ -n "$TRUST_IMPORT" ] && [ "$DRY_RUN" = 0 ]; then
+    trust_file_add "$(trust_raw_file "$TRUST_IMPORT" | paste -sd, -)" && ok "Adressen uit $TRUST_IMPORT samengevoegd in $TRUST_FILE"
+  fi
   [ "$SCOPE" = all ] || scope_hosts >/dev/null
   print_env
   if [ "$MODE" = strict ]; then
@@ -1235,10 +1286,42 @@ do_install() {
 do_reapply() {
   need_root; detect_env
   load_state || die "Niet geïnstalleerd; gebruik install"
+  validate_trust
   DO_TEST=0; DO_WATCH=0; QUIET=1
   PLESK_RECONF_ALL=0      # alleen nieuwe Plesk-domeinen herconfigureren, niet alles
   apply_all
   return 0
+}
+
+# trust list | add ... | remove ... | clear  -> beheert trust.txt en zet de
+# wijziging direct live (configs opnieuw genereren, alleen herladen wat veranderde)
+do_trust() {
+  local sub="${1:-list}"; shift || true
+  need_root; detect_env; load_state || true
+  case "$sub" in
+    list)
+      say "Vertrouwde adressen (effectief: --trust uit install + $TRUST_FILE):"
+      trust_list | sed 's/^/  /'; [ -n "$(trust_list)" ] || say "  (geen)" ;;
+    add)
+      [ $# -gt 0 ] || die "Gebruik: php2shell-shield trust add IP[,IP/CIDR,...]"
+      trust_file_add "$@" && ok "Toegevoegd aan $TRUST_FILE" || say "Niets nieuws; alles stond er al."
+      trust_apply ;;
+    remove)
+      [ $# -gt 0 ] || die "Gebruik: php2shell-shield trust remove IP[,IP/CIDR,...]"
+      trust_file_remove "$@" && ok "Verwijderd uit $TRUST_FILE"
+      trust_apply ;;
+    clear)
+      : > "$TRUST_FILE"; ok "$TRUST_FILE geleegd"; trust_apply ;;
+    *) die "Gebruik: php2shell-shield trust list | add IP[,IP] | remove IP[,IP] | clear" ;;
+  esac
+}
+trust_apply() {
+  validate_trust
+  if [ ! -f "$STATE_FILE" ]; then say "Nog niet geïnstalleerd; de lijst wordt bij 'install' meegenomen."; return 0; fi
+  DO_TEST=0; DO_WATCH=0; PLESK_RECONF_ALL=0
+  info "Configuratie bijwerken met vertrouwde adressen: $(trust_summary)"
+  apply_all
+  ok "Live. Deze adressen mogen multipart sturen en worden nooit gebant."
 }
 
 do_uninstall() {
@@ -1275,6 +1358,7 @@ main() {
     case "$1" in
       --mode)        MODE="$2"; shift ;;
       --trust)       TRUST="${TRUST:+$TRUST,}$2"; shift ;;
+      --trust-file)  TRUST_IMPORT="$2"; shift ;;
       --scope)       SCOPE="$2"; shift ;;
       --fixed)       FIXED_VERSIONS="$2"; shift ;;
       --ban-hosts)   BAN_HOSTS="$2"; shift ;;
@@ -1305,6 +1389,7 @@ main() {
     eol-domains) need_root; detect_env; do_eol_domains ;;
     watch)       need_root; detect_env; watch_loop ;;
     unban)       need_root; unban_ip "${UNBAN_IP:-}" ;;
+    trust)       do_trust "${TRUST_SUB:-list}" ${TRUST_ARGS:+$TRUST_ARGS} ;;
     bans)        [ -f "$BAN_LOG" ] && cat "$BAN_LOG" || say "Nog geen bans." ;;
     version)     echo "php2shell-shield $VERSION" ;;
     help|*)      usage ;;
@@ -1312,7 +1397,8 @@ main() {
 }
 
 if [ "${PHP2SHELL_SHIELD_LIB:-0}" != 1 ]; then
-  # 'unban IP' heeft een positioneel argument
+  # 'unban IP' en 'trust add|remove IP...' hebben positionele argumenten
   if [ "${1:-}" = unban ]; then UNBAN_IP="${2:-}"; [ -n "$UNBAN_IP" ] || die "Gebruik: php2shell-shield unban IP"; set -- unban; fi
+  if [ "${1:-}" = trust ]; then TRUST_SUB="${2:-list}"; shift 2 2>/dev/null || shift $#; TRUST_ARGS="$*"; set -- trust; fi
   main "$@"
 fi
