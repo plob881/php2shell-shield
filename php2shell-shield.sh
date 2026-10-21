@@ -44,7 +44,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -75,6 +75,7 @@ MEMORY_UNLIMITED=0   # --memory-unlimited: PHP-advies memory_limit=-1 (alleen me
 RESTORE_PHP_INI=0
 BAN_HOSTS=8          # ban als één IP op >= N verschillende hosts geblokkeerd wordt (scanner-gedrag)
 BAN_COUNT=0          # ban als één IP >= N geblokkeerde verzoeken stuurt (0 = uit; pas op met bulk-uploads)
+BAN_PATHS=10         # ban als één IP >= N verschillende host+pad-combinaties raakt (scanner probeert veel paden; 0 = uit)
 BAN_TTL=3600         # seconden (csf/ipset/nft verlopen vanzelf)
 BAN_WINDOW=300       # seconden waarbinnen geteld wordt
 # Verwachte gefixte versies (per PHP-tak). Controleer na de release op php.net
@@ -199,6 +200,7 @@ STRICT_SESSIONS=$STRICT_SESSIONS
 MEMORY_UNLIMITED=$MEMORY_UNLIMITED
 BAN_HOSTS=$BAN_HOSTS
 BAN_COUNT=$BAN_COUNT
+BAN_PATHS=$BAN_PATHS
 BAN_TTL=$BAN_TTL
 BAN_WINDOW=$BAN_WINDOW
 FIXED_VERSIONS=$FIXED_VERSIONS
@@ -212,7 +214,7 @@ load_state() {
   local k v
   while IFS='=' read -r k v; do
     case "$k" in
-      MODE|TRUST|SCOPE|STRICT_SESSIONS|MEMORY_UNLIMITED|BAN_HOSTS|BAN_COUNT|BAN_TTL|BAN_WINDOW|FIXED_VERSIONS)
+      MODE|TRUST|SCOPE|STRICT_SESSIONS|MEMORY_UNLIMITED|BAN_HOSTS|BAN_COUNT|BAN_PATHS|BAN_TTL|BAN_WINDOW|FIXED_VERSIONS)
         printf -v "$k" '%s' "$v" ;;
     esac
   done < "$STATE_FILE"
@@ -971,7 +973,7 @@ WantedBy=multi-user.target" >/dev/null || true
   [ "$DRY_RUN" = 1 ] && return 0
   systemctl daemon-reload
   systemctl enable --now "$UNIT_NAME" >/dev/null 2>&1 && systemctl restart "$UNIT_NAME" >/dev/null 2>&1
-  ok "Watch-service actief ($UNIT_NAME): ban na >= $(effective_ban_hosts) verschillende hosts binnen ${BAN_WINDOW}s (server heeft $(server_host_count) domeinen, max $BAN_HOSTS)$([ "$BAN_COUNT" -gt 0 ] && printf ' of %s verzoeken' "$BAN_COUNT"), ttl ${BAN_TTL}s"
+  ok "Watch-service actief ($UNIT_NAME): ban na >= $(effective_ban_hosts) verschillende hosts (server heeft $(server_host_count) domeinen, max $BAN_HOSTS) of >= $BAN_PATHS verschillende paden$([ "$BAN_COUNT" -gt 0 ] && printf ' of %s verzoeken' "$BAN_COUNT") binnen ${BAN_WINDOW}s, ttl ${BAN_TTL}s; eigen IP's tellen niet mee"
 }
 
 remove_watch() {
@@ -1008,6 +1010,10 @@ effective_ban_hosts() {
   [ "$e" -gt "$BAN_HOSTS" ] && e=$BAN_HOSTS
   echo "$e"
 }
+
+# eigen adressen van deze server (zelftest-verkeer komt hiervandaan)
+own_ips() { hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$'; echo 127.0.0.1; }
+is_own_ip() { local x; for x in $(own_ips); do [ "$x" = "$1" ] && return 0; done; [[ "$1" == 127.* ]]; }
 
 never_ban() {
   local ip="$1" c
@@ -1069,29 +1075,32 @@ remove_firewall_sets() {
 watch_loop() {
   load_state || true
   mkdir -p "$LOG_DIR"; touch "$BLOCK_LOG"
-  declare -A ip_first ip_count ip_hosts ip_banned
-  local ts ip host rest now h nh last_maint eff
+  declare -A ip_first ip_count ip_hosts ip_paths ip_npaths ip_banned
+  local ts ip host method uri status now h nh last_maint eff
   last_maint=$(date +%s); eff=$(effective_ban_hosts)
-  logger -t php2shell-shield "watch gestart (ban bij >= $eff hosts, max $BAN_HOSTS; ban_count=$BAN_COUNT window=${BAN_WINDOW}s ttl=${BAN_TTL}s)" 2>/dev/null || true
+  logger -t php2shell-shield "watch gestart (ban bij >= $eff hosts of >= $BAN_PATHS paden, max hosts $BAN_HOSTS; ban_count=$BAN_COUNT window=${BAN_WINDOW}s ttl=${BAN_TTL}s)" 2>/dev/null || true
   exec 3< <(tail -n 0 -F "$BLOCK_LOG" 2>/dev/null)
   while true; do
-    if read -r -t 30 -u 3 ts ip host rest; then
+    if read -r -t 30 -u 3 ts ip host method uri status; then
       [ -n "${ip:-}" ] || continue
       [ -n "${ip_banned[$ip]:-}" ] && continue
+      is_own_ip "$ip" && continue          # zelftest-verkeer telt niet mee
       now=$(date +%s)
       if [ -z "${ip_first[$ip]:-}" ] || [ $(( now - ip_first[$ip] )) -gt "$BAN_WINDOW" ]; then
-        ip_first[$ip]=$now; ip_count[$ip]=0; ip_hosts[$ip]=" "
+        ip_first[$ip]=$now; ip_count[$ip]=0; ip_hosts[$ip]=" "; ip_paths[$ip]="|"; ip_npaths[$ip]=0
       fi
       ip_count[$ip]=$(( ip_count[$ip] + 1 ))
       h="${host%%:*}"; h="${h,,}"
       case "${ip_hosts[$ip]}" in *" $h "*) ;; *) ip_hosts[$ip]="${ip_hosts[$ip]}$h " ;; esac
+      case "${ip_paths[$ip]}" in *"|$h ${uri:-/}|"*) ;; *) ip_paths[$ip]="${ip_paths[$ip]}$h ${uri:-/}|"; ip_npaths[$ip]=$(( ip_npaths[$ip] + 1 )) ;; esac
       nh=$(printf '%s' "${ip_hosts[$ip]}" | wc -w)
-      if [ "$nh" -ge "$eff" ] || { [ "$BAN_COUNT" -gt 0 ] && [ "${ip_count[$ip]}" -ge "$BAN_COUNT" ]; }; then
+      if [ "$nh" -ge "$eff" ] || { [ "$BAN_PATHS" -gt 0 ] && [ "${ip_npaths[$ip]}" -ge "$BAN_PATHS" ]; } \
+         || { [ "$BAN_COUNT" -gt 0 ] && [ "${ip_count[$ip]}" -ge "$BAN_COUNT" ]; }; then
         if never_ban "$ip"; then
-          # privé-/vertrouwd/Cloudflare/eigen adres: wel melden, niet bannen (zelftest via loopback niet)
-          case "$ip" in 127.*) ;; *) echo "$(date -Is) SKIP $ip multipart op $nh host(s), ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s - niet gebant (privé/vertrouwd/Cloudflare/eigen IP); zoek uit wie dit is" >> "$BAN_LOG" ;; esac
+          # privé-/vertrouwd/Cloudflare-adres: wel melden, niet bannen
+          echo "$(date -Is) SKIP $ip multipart op $nh host(s), ${ip_npaths[$ip]} paden, ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s - niet gebant (privé/vertrouwd/Cloudflare); zoek uit wie dit is" >> "$BAN_LOG"
         else
-          ban_ip "$ip" "multipart op $nh host(s), ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s"
+          ban_ip "$ip" "multipart op $nh host(s), ${ip_npaths[$ip]} paden, ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s"
         fi
         ip_banned[$ip]=1
       fi
@@ -1298,10 +1307,14 @@ do_status() {
     say "Watch-service: $(systemctl is-active $UNIT_NAME 2>/dev/null || echo inactief)"
   fi
   if [ -f "$BLOCK_LOG" ]; then
-    hr; say "Geblokkeerd/gelogd: $(wc -l < "$BLOCK_LOG") regels totaal; top-IP's (laatste 5000; 127.0.0.1 = zelftest):"
-    tail -n 5000 "$BLOCK_LOG" | awk '{print $2}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /; s/127\.0\.0\.1$/127.0.0.1 (zelftest)/'
-    say "IP's naar aantal verschillende hosts (scanner-indicatie; ban bij >= $(effective_ban_hosts) hosts binnen ${BAN_WINDOW}s, privé-/vertrouwde adressen nooit):"
-    tail -n 5000 "$BLOCK_LOG" | awk '{split($3,a,":"); print $2, tolower(a[1])}' | sort -u | awk '{c[$1]++} END{for (i in c) print c[i], i}' | sort -rn | head -10 | sed 's/^/  /'
+    local own; own=" $(own_ips | paste -sd' ' -) "
+    hr; say "Geblokkeerd/gelogd: $(wc -l < "$BLOCK_LOG") regels totaal; top-IP's (laatste 5000):"
+    tail -n 5000 "$BLOCK_LOG" | awk '{print $2}' | sort | uniq -c | sort -rn | head -10 \
+      | awk -v own="$own" '{lbl=(index(own, " " $2 " ")>0) ? "  (eigen IP: zelftest)" : ""; print "  " $1 " " $2 lbl}'
+    say "IP's naar aantal verschillende hosts / paden (scanner-indicatie; ban bij >= $(effective_ban_hosts) hosts of >= $BAN_PATHS paden binnen ${BAN_WINDOW}s; privé/vertrouwd nooit):"
+    tail -n 5000 "$BLOCK_LOG" | awk '{split($3,a,":"); print $2, tolower(a[1]), $5}' | sort -u \
+      | awk '{p[$1]++; k=$1 SUBSEP $2; if (!(k in seen)) {seen[k]=1; h[$1]++}} END{for (i in p) print h[i] " hosts, " p[i] " paden  " i}' | sort -rn | head -10 \
+      | awk -v own="$own" '{lbl=(index(own, " " $NF " ")>0) ? "  (eigen IP: zelftest)" : ""; print "  " $0 lbl}'
     say "Top-hosts (laatste 5000):"
     tail -n 5000 "$BLOCK_LOG" | awk '{print $3}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /'
     say "Details van één IP: grep IP $BLOCK_LOG"
@@ -1456,6 +1469,7 @@ main() {
       --fixed)       FIXED_VERSIONS="$2"; shift ;;
       --ban-hosts)   BAN_HOSTS="$2"; shift ;;
       --ban-count)   BAN_COUNT="$2"; shift ;;
+      --ban-paths)   BAN_PATHS="$2"; shift ;;
       --ban-ttl)     BAN_TTL="$2"; shift ;;
       --ban-window)  BAN_WINDOW="$2"; shift ;;
       --probe)       PROBE_DOMAIN="$2"; shift ;;

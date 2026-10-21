@@ -231,9 +231,17 @@ php2shell-shield bans              # banlog
 php2shell-shield unban 203.0.113.9 # IP vrijgeven (csf/ipset/nft/iptables)
 ```
 
-Drempels bij install: `--ban-hosts 8` (verschillende hosts), `--ban-count 0`
-(absoluut aantal, uit), `--ban-window 300`, `--ban-ttl 3600`. IPv6-adressen
-worden gelogd maar niet gebant. Met `--no-watch` sla je de service over.
+Een IP wordt gebant als het binnen het venster (`--ban-window 300` seconden)
+multipart-verzoeken stuurt naar te veel **verschillende hosts** (`--ban-hosts 8`;
+op een server met minder domeinen driekwart daarvan, minimaal 3) of naar te
+veel **verschillende paden** (`--ban-paths 10`, want een scanner probeert
+tientallen paden op één site, een echte gebruiker steeds hetzelfde
+upload- of formulierpad). `--ban-count 0` (absoluut aantal) staat uit;
+`--ban-ttl 3600` is de banduur. Privé-, vertrouwde en Cloudflare-adressen
+worden nooit gebant maar wel als `SKIP` in het banlog gemeld; de eigen IP's
+van de server (zelftest) tellen niet mee en staan in `status` gemarkeerd.
+IPv6-adressen worden gelogd maar niet gebant. Met `--no-watch` sla je de
+service over.
 
 ## Wat het script precies aanraakt (en terugdraait)
 
