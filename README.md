@@ -212,6 +212,23 @@ De paneelpakketten lopen uren tot dagen achter op php.net.
 - **Kaal Debian/Ubuntu/RHEL:** `apt`/`dnf` zodra de distributie of Sury/Remi
   levert (Remi heeft aangekondigd niet op de releasedag te leveren).
 
+### Eerst kijken: levert CustomBuild de backport al zelf?
+
+DirectAdmin onderhoudt voor EOL-versies eigen beveiligingspatches in
+`/usr/local/directadmin/custombuild/patches/php-<versie>/`, en voor 7.4 zit
+daar sinds 21 oktober 2026 een `143-php-7.4-cve-2026-109618.patch` bij. Op een
+server met een actuele licentie is een eigen tarball dan niet nodig en zelfs
+onhandig (de DirectAdmin-patches botsen met de branch). Controleer het zo:
+
+```bash
+cd /usr/local/directadmin/custombuild && ./build update >/dev/null 2>&1; for v in 5.6 7.3 7.4 8.0 8.1; do printf 'php %s: %s patch(es) voor CVE-2026-109618\n' "$v" "$(ls patches/php-$v/ 2>/dev/null | grep -ci 109618)"; done
+```
+
+Staat er voor jouw versie 1 of meer, dan is `./build php_expert 7.4 php-fpm`
+(of `./build php n` voor alle ingestelde versies) genoeg; CustomBuild past de
+patch zelf toe. Alleen op servers met een bevroren versielijst (legacy-licentie)
+blijft de route hieronder nodig.
+
 ### PHP 8.1 zelf patchen met de officiële backport (DirectAdmin CustomBuild)
 
 Krijgt je server geen gepatchte 8.1 van DirectAdmin (bijvoorbeeld een legacy-
