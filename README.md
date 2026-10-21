@@ -6,18 +6,40 @@ afschermt, totdat PHP overal gepatcht is.
 
 ## Waarom dit werkt terwijl per-site maatregelen niet werken
 
-Beide CVE's zitten in de manier waarop PHP zelf een `multipart/form-data`-body
-verwerkt. Dat gebeurt **vóórdat** ook maar één regel applicatiecode draait:
+Beide fouten zitten in het inlezen en opruimen van een verzoek door PHP zelf.
+Dat gebeurt **vóórdat** ook maar één regel applicatiecode draait:
 WordPress-logins, CSRF-checks, security-plugins, maintenance mode, `.htaccess`
 met `php_flag` enz. komen allemaal te laat. De enige plek waar je zo'n verzoek
 tegenhoudt vóór PHP is de **webserver** (of een WAF/proxy daarvoor).
+
+Sinds de release van 21 oktober 2026 zijn de oorzaken officieel bekend:
+
+- **CVE-2026-109618 (RCE via OOM corruption):** loopt PHP tijdens het inlezen
+  van een verzoek tegen `memory_limit` aan, dan blijft half-geïnitialiseerde
+  staat achter die bij het opruimen misbruikt wordt. Alle manieren die PHP
+  beschrijft om dat af te dwingen lopen via `multipart/form-data`: chunked
+  zonder Content-Length (omzeilt `post_max_size`), een onbeperkt aantal
+  part-headers, lege bestandsvelden met geneste namen. Bij mod_php is RCE
+  bewezen met standaardlimieten; FPM is kwetsbaar maar daar is geen volledig
+  exploit gedemonstreerd.
+- **CVE-2026-109619 (RCE via stale global state):** staat van een vorig
+  verzoek blijft na een fatale fout (OOM, time-out) op dezelfde worker
+  achter en wordt door een volgend verzoek gelezen vóór de normale
+  initialisatie. Bevestigde routes: session upload-progress (multipart) en op
+  PHP 8.5 `fatal_error_backtraces`.
+
+PHP's eigen advies zegt letterlijk: blokkeer multipart aan de voorkant als de
+applicatie het niet nodig heeft, zet `session.upload_progress` uit (ook na het
+patchen) en op 8.5 `fatal_error_backtraces=0`. Dit script doet precies dat,
+serverbreed. PHP zegt óók dat alleen updaten een volledige oplossing is: de
+maatregelen dekken de gedocumenteerde routes, niet elke denkbare variant.
 
 Het script legt daarom drie lagen over de hele server heen:
 
 | Laag | Wat | Waar |
 |------|-----|------|
 | 1. Webserver | Elk verzoek met `Content-Type: multipart/...` krijgt 403, ongeacht methode, pad of site. Vertrouwde IP's (`--trust`) en een optionele hostlijst (`--scope`) vallen erbuiten. | Apache: globale `<If>`-regel met `Require all denied` (servercontext, geldt voor alle vhosts). nginx: `map` + `if ... return 403` in elk `server{}`-blok via de officiële DirectAdmin-tokens / Plesk `vhost_nginx.conf`. OpenLiteSpeed/LiteSpeed: rewrite-regel via DirectAdmin-token. |
-| 2. PHP | `session.upload_progress.enabled = Off` in álle php.ini's (DirectAdmin `/usr/local/php*/lib/php.ini`, Plesk `/opt/plesk/php/*/etc/php.ini`, OS-PHP, Remi, cPanel, CloudLinux, lsphp, Plesk-paneel) plus een drop-in `99-php2shell-shield.ini` in elke `php.conf.d`/`php.d`/`conf.d`. Daarna worden alle PHP-FPM-diensten herladen. Dit is de tot nu toe bekende aanvalsroute; onderzoekers zeggen dat dit alléén niet volstaat, daarom laag 1. | overal |
+| 2. PHP | `session.upload_progress.enabled = Off` in álle php.ini's (DirectAdmin `/usr/local/php*/lib/php.ini`, Plesk `/opt/plesk/php/*/etc/php.ini`, OS-PHP, Remi, cPanel, CloudLinux, lsphp, Plesk-paneel) plus een drop-in `99-php2shell-shield.ini` in elke `php.conf.d`/`php.d`/`conf.d` met ook `fatal_error_backtraces = 0` (PHP 8.5). Daarna worden alle PHP-FPM-diensten herladen. Dit zijn de door PHP bevestigde routes voor CVE-2026-109619; PHP zegt zelf dat dit alléén niet volstaat, daarom laag 1. Optioneel `--memory-unlimited` voor PHP's primaire maatregel tegen CVE-2026-109618 (`memory_limit = -1`, zie kanttekeningen). | overal |
 | 3. Watch-service | Elk geblokkeerd verzoek wordt centraal gelogd (`/var/log/php2shell-shield/blocked.log`). Een systemd-service leest dat log en zet IP's die binnen 5 minuten op 8 of meer verschillende hosts multipart afvuren (scanner-gedrag) 1 uur in de firewall (CSF, anders ipset/iptables, anders nftables). Cloudflare-ranges, privé-adressen, de eigen server-IP's en `--trust`-adressen worden nooit gebant. De service past elke 5 minuten ook de configuratie opnieuw toe (nieuwe Plesk-domeinen krijgen de include). | `php2shell-watch.service` |
 
 Daarnaast: ModSecurity-regels (ID 99901–99904) die het bekende exploitpatroon
@@ -147,7 +169,7 @@ Alternatieven, in oplopend risico:
 
 | Mode / optie | Beschermt tegen | Nadeel |
 |---|---|---|
-| `--mode strict` (standaard) | beide CVE's, ook de onbekende tweede route | uploads/FormData-formulieren uit |
+| `--mode strict` (standaard) | alle door PHP gedocumenteerde aanvalsroutes (allemaal multipart) | uploads/FormData-formulieren uit |
 | `--mode strict --scope BESTAND` | alleen de hosts in het bestand (incl. hun subdomeinen) | andere sites zijn open |
 | `--mode monitor` | niets; logt alleen welke multipart-verzoeken er zijn | meetinstrument vooraf: hoeveel klanten raak je? |
 | `--mode signature` | alleen het bekende patroon (upload-progress-veld), via php.ini + ModSecurity | tweede route blijft open; ModSecurity moet draaien |
@@ -163,18 +185,30 @@ php2shell-shield install --scope /etc/php2shell-shield/scope.txt --trust JOUW.KA
 
 ## Zodra de PHP-patch beschikbaar is
 
-PHP brengt de fix op 21 oktober 2026 14:00 UTC uit voor de takken 8.2, 8.3,
-8.4 en 8.5 (verwacht: 8.2.35, 8.3.36, 8.4.27, 8.5.12; controleer php.net).
-**PHP 8.1 en ouder krijgen geen fix.** De paneelpakketten lopen uren tot dagen
-achter op php.net.
+De fix is op 21 oktober 2026 uitgebracht: **8.2.35, 8.3.36, 8.4.27 en
+8.5.12** (dat zijn de versies die `status` standaard als "OK" beoordeelt).
+Voor **PHP 7.4, 8.0 en 8.1** publiceert PHP geen release, maar wel minimale
+bron-backports voor vendors die zelf bouwen:
+[PHP-7.4](https://github.com/php/php-src/tree/PHP-7.4-CVE-2026-109618-109619),
+[PHP-8.0](https://github.com/php/php-src/tree/PHP-8.0-CVE-2026-109618-109619),
+[PHP-8.1](https://github.com/php/php-src/tree/PHP-8.1-CVE-2026-109618-109619).
+De paneelpakketten lopen uren tot dagen achter op php.net.
 
 - **DirectAdmin (CustomBuild):**
   `cd /usr/local/directadmin/custombuild && ./build update && ./build versions`
   toont zodra de nieuwe versies beschikbaar zijn; dan `./build php n`.
-- **Plesk:** de fix komt in de Plesk-PHP-pakketten (Tools & Settings > Updates,
-  of `apt-get update && apt-get install --only-upgrade 'plesk-php*'` /
-  `dnf upgrade 'plesk-php*'`). Vergeet de OS-PHP (`php-fpm`/`php8.x-fpm`) en de
-  PHP van het paneel zelf niet.
+  CustomBuild bouwt PHP uit bron, dus ook een gepatchte 8.1 kan daar komen;
+  omdat het versienummer dan gelijk blijft, kijk je in het CustomBuild-
+  changelog of DirectAdmin-forum of de backport erin zit. Tot die tijd: de
+  blokkade laten staan, of een tweede PHP-versie (8.3/8.4) erbij bouwen en de
+  sites daarop zetten.
+- **Plesk:** heeft een eigen advisory (KB 44397729587351): alle meegeleverde
+  PHP-versies 7.4 t/m 8.5 zijn kwetsbaar en worden herbouwd, en het paneel zelf
+  krijgt een sw-engine-hotfix (18.0.80#11 / 18.0.81#4). Installeer dus Plesk-
+  updates (Tools & Settings > Updates of `plesk installer update`) én de
+  herbouwde pakketten (`apt-get update && apt-get install --only-upgrade
+  'plesk-php*'` / `dnf upgrade 'plesk-php*'`). Vergeet de OS-PHP
+  (`php-fpm`/`php8.x-fpm`) niet.
 - **Kaal Debian/Ubuntu/RHEL:** `apt`/`dnf` zodra de distributie of Sury/Remi
   levert (Remi heeft aangekondigd niet op de releasedag te leveren).
 
@@ -224,10 +258,21 @@ de service, de firewallsets en de logrotate-regel, en laat de backups staan.
 
 ## Kanttekeningen die je moet kennen
 
-- **De technische details zijn nog onder embargo.** Dat het blokkeren van
-  multipart beide CVE's volledig afdekt is de breed gedragen inschatting van
-  onderzoekers (PHP verwerkt multipart vóór alle applicatiecode), geen officiële
-  garantie. Patchen blijft de echte oplossing; dit koopt tijd.
+- **Geen volledige garantie.** PHP's advisory noemt het blokkeren van multipart
+  aan de voorkant expliciet als maatregel, en alle gedocumenteerde manieren om
+  de fouten te triggeren lopen via multipart. Maar PHP schrijft ook dat een
+  OOM "op applicatiespecifieke manieren" bereikt kan worden en dat alleen
+  updaten volledig is. Dit koopt tijd; patchen of migreren blijft nodig.
+- **`--memory-unlimited` is PHP's primaire configuratiemaatregel tegen
+  CVE-2026-109618** (`memory_limit = -1`, administratief afgedwongen), maar op
+  shared hosting haalt het de rem van het geheugengebruik per script. Gebruik
+  het alleen met een cgroup- of containerlimiet als vangnet, en nooit via
+  `RLIMIT_AS`/`RLIMIT_DATA` (die triggeren juist het kwetsbare pad). Bij
+  FPM-pools die zelf een `php_admin_value[memory_limit]` zetten (Plesk,
+  sommige DirectAdmin-templates) wint de pool; controleer met `--probe`.
+- **mod_php is de gevaarlijkste SAPI** (RCE bewezen met standaardlimieten);
+  `php2shell-shield scan` waarschuwt als een PHP-versie als mod_php draait en
+  als de webserver `PHP_VALUE`/`PHP_ADMIN_VALUE` naar FPM doorgeeft.
 - **Het Plesk-paneel zelf (poort 8443/8880) draait ook PHP** en valt buiten
   deze blokkade. Beperk die poorten in de firewall tot je eigen IP's; Plesks
   eigen "beperk administratieve toegang" zit in PHP en is dus te laat.

@@ -20,6 +20,8 @@
 #                               [--trust IP[,IP/CIDR,...]] [--trust-file BESTAND]
 #                               [--scope all|BESTAND]
 #                               [--no-php-ini] [--no-watch] [--no-test] [--dry-run]
+#                               [--memory-unlimited]  (PHP-advies memory_limit=-1 tegen
+#                                CVE-2026-109618; alleen met cgroup/containerlimiet als vangnet)
 #    php2shell-shield.sh trust list | add IP[,IP/CIDR,...] | remove IP | clear
 #                                           (lijst in /etc/php2shell-shield/trust.txt,
 #                                            wijzigingen gaan direct live)
@@ -42,7 +44,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.1.2"
+VERSION="1.2.0"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -69,6 +71,7 @@ DO_TEST=1
 DRY_RUN=0
 QUIET=0
 STRICT_SESSIONS=0
+MEMORY_UNLIMITED=0   # --memory-unlimited: PHP-advies memory_limit=-1 (alleen met cgroup/containerlimiet als vangnet)
 RESTORE_PHP_INI=0
 BAN_HOSTS=8          # ban als één IP op >= N verschillende hosts geblokkeerd wordt (scanner-gedrag)
 BAN_COUNT=0          # ban als één IP >= N geblokkeerde verzoeken stuurt (0 = uit; pas op met bulk-uploads)
@@ -193,6 +196,7 @@ MODE=$MODE
 TRUST=$TRUST
 SCOPE=$SCOPE
 STRICT_SESSIONS=$STRICT_SESSIONS
+MEMORY_UNLIMITED=$MEMORY_UNLIMITED
 BAN_HOSTS=$BAN_HOSTS
 BAN_COUNT=$BAN_COUNT
 BAN_TTL=$BAN_TTL
@@ -208,7 +212,7 @@ load_state() {
   local k v
   while IFS='=' read -r k v; do
     case "$k" in
-      MODE|TRUST|SCOPE|STRICT_SESSIONS|BAN_HOSTS|BAN_COUNT|BAN_TTL|BAN_WINDOW|FIXED_VERSIONS)
+      MODE|TRUST|SCOPE|STRICT_SESSIONS|MEMORY_UNLIMITED|BAN_HOSTS|BAN_COUNT|BAN_TTL|BAN_WINDOW|FIXED_VERSIONS)
         printf -v "$k" '%s' "$v" ;;
     esac
   done < "$STATE_FILE"
@@ -417,6 +421,17 @@ EOF
 <IfModule mod_log_config.c>
     LogFormat "%{%Y-%m-%dT%H:%M:%S%z}t %a %{Host}i %m %U %>s" php2shell_shield
     GlobalLog "$BLOCK_LOG" php2shell_shield env=php2shell_block
+</IfModule>
+EOF
+  fi
+  if [ "$MEMORY_UNLIMITED" = 1 ]; then
+    cat <<'EOF'
+# PHP-advies tegen CVE-2026-109618 (mod_php): geheugenlimiet administratief uit, niet overschrijfbaar
+<IfModule php_module>
+    php_admin_value memory_limit -1
+</IfModule>
+<IfModule php7_module>
+    php_admin_value memory_limit -1
 </IfModule>
 EOF
   fi
@@ -823,8 +838,14 @@ set_ini_directive() {
 
 php_dropin_content() {
   echo "; php2shell-shield - noodmaatregel CVE-2026-109618 / CVE-2026-109619"
-  echo "; session upload-progress is de tot nu toe bekende aanvalsroute; uitzetten kost niets."
+  echo "; session upload-progress: bevestigde route voor CVE-2026-109619 (PHP-advies: uit, ook na patchen)"
   echo "session.upload_progress.enabled = Off"
+  echo "; PHP 8.5: bevestigde route via fatal-error-backtraces (oudere versies negeren deze regel)"
+  echo "fatal_error_backtraces = 0"
+  if [ "$MEMORY_UNLIMITED" = 1 ]; then
+    echo "; PHP-advies tegen CVE-2026-109618: geen PHP-geheugenlimiet, zodat het OOM-pad niet aanstuurbaar is"
+    echo "memory_limit = -1"
+  fi
   [ "$STRICT_SESSIONS" = 1 ] && echo "session.use_strict_mode = 1"
   return 0
 }
@@ -834,6 +855,7 @@ php_harden() {
   for f in $(php_ini_files); do
     set_ini_directive "$f" "session.upload_progress.enabled" "Off" && { n=$((n+1)); CHANGED_PHP=1; }
     [ "$STRICT_SESSIONS" = 1 ] && { set_ini_directive "$f" "session.use_strict_mode" "1" && CHANGED_PHP=1; }
+    [ "$MEMORY_UNLIMITED" = 1 ] && { set_ini_directive "$f" "memory_limit" "-1" && CHANGED_PHP=1; }
   done
   for d in $(php_dropin_dirs); do
     write_file "$d/$DROPIN_NAME" "$(php_dropin_content)" && { m=$((m+1)); CHANGED_PHP=1; }
@@ -903,7 +925,8 @@ php_report() {
     st=$(fixed_status "${ver:-0}")
     printf '  %-52s %-10s upload_progress=%-6s %s\n' "$b" "${ver:-?}" "${up:-?}" "$st"
   done
-  say "  (EOL = krijgt géén officiële fix: blokkade laten staan of migreren)"
+  say "  (EOL = geen fix van php.net; alleen veilig met een vendor-backport (DirectAdmin CustomBuild, Plesk, distributie)"
+  say "   of na migratie naar 8.2+. De blokkade dekt de door PHP gedocumenteerde routes; updaten blijft de enige volledige fix.)"
 }
 
 # =============================================================================
@@ -1158,6 +1181,24 @@ do_scan() {
   local roots f n
   hr; say "Scan: wat is er nog kwetsbaar of verdacht?"
   php_report
+  hr; say "SAPI-risico's volgens het PHP-advies (mod_php = hoogste risico; FPM met PHP_VALUE-doorgifte = extra ingang):"
+  local i mode rel pv
+  if [ "$PANEL" = directadmin ]; then
+    for i in 1 2 3 4; do
+      rel=$(grep -E "^php${i}_release=" /usr/local/directadmin/custombuild/options.conf 2>/dev/null | cut -d= -f2)
+      mode=$(grep -E "^php${i}_mode=" /usr/local/directadmin/custombuild/options.conf 2>/dev/null | cut -d= -f2)
+      [ -n "$rel" ] && [ "$rel" != no ] || continue
+      if [ "$mode" = mod_php ]; then warn "php$i ($rel) draait als mod_php: zet om naar php-fpm (./build set php${i}_mode php-fpm && ./build php n)"; else say "  php$i ($rel): $mode"; fi
+    done
+  fi
+  if [ "$HAVE_APACHE" = 1 ]; then
+    { case "$APACHE_BIN" in apache2) apache2ctl -M ;; *) httpd -M ;; esac; } 2>/dev/null | grep -qiE 'php[0-9]*_module' && warn "Apache heeft mod_php geladen (hoogste risico volgens PHP: RCE bewezen bij standaardlimieten)"
+  fi
+  if [ "$PANEL" = plesk ] && plesk bin php_handler --list 2>/dev/null | grep -qiE 'module'; then
+    warn "Plesk: er bestaat een 'Apache module' (mod_php) PHP-handler; controleer welke domeinen die gebruiken en zet ze op FPM"
+  fi
+  pv=$(grep -rlsE 'PHP_(ADMIN_)?VALUE' /etc/nginx /etc/httpd /etc/apache2 /usr/local/directadmin/data/users 2>/dev/null | head -5)
+  if [ -n "$pv" ]; then warn "Frontend stuurt PHP_VALUE/PHP_ADMIN_VALUE naar FPM (vroege 'consumer' voor CVE-2026-109619); controleer:"; printf '%s\n' "$pv" | sed 's/^/  /'; else say "  geen PHP_VALUE/PHP_ADMIN_VALUE-doorgifte in de webserverconfigs gevonden"; fi
   hr; say "Per-site overrides die upload_progress weer AAN zetten (.user.ini / .htaccess / php.ini):"
   roots="/home /var/www /usr/local/www /var/www/vhosts/system"
   timeout 180 find $roots -maxdepth 7 -type f \( -name .user.ini -o -name .htaccess -o -name php.ini \) 2>/dev/null \
@@ -1291,7 +1332,7 @@ do_install() {
   if [ "$MODE" = strict ]; then
     warn "Mode strict: ALLE multipart/form-data-verzoeken worden geweigerd (403). Uploads, media-uploads in"
     warn "WordPress, plugin-zips en formulieren die FormData/bijlagen sturen (Contact Form 7, Gravity Forms,"
-    warn "WPForms) vallen tijdelijk uit. Dit is de enige maatregel die beide CVE's zeker buiten de deur houdt."
+    warn "WPForms) vallen tijdelijk uit. Alle door PHP gedocumenteerde aanvalsroutes lopen via multipart; updaten blijft de enige volledige fix."
   fi
   [ "$DRY_RUN" = 1 ] && warn "DRY-RUN: er wordt niets gewijzigd."
   apply_all
@@ -1394,6 +1435,7 @@ main() {
       --no-watch)    DO_WATCH=0 ;;
       --no-test)     DO_TEST=0 ;;
       --strict-sessions) STRICT_SESSIONS=1 ;;
+      --memory-unlimited) MEMORY_UNLIMITED=1 ;;
       --restore-php-ini) RESTORE_PHP_INI=1 ;;
       --dry-run)     DRY_RUN=1 ;;
       --quiet)       QUIET=1 ;;
