@@ -28,6 +28,8 @@
 #    php2shell-shield.sh status | test [--probe DOMEIN] | scan | reapply
 #    php2shell-shield.sh eol-domains        (hostlijst met EOL-PHP voor --scope)
 #    php2shell-shield.sh uninstall [--restore-php-ini]
+#    php2shell-shield.sh cleanup            (na uninstall: include-bestanden weg zodra geen
+#                                            gegenereerde config er nog naar verwijst)
 #    php2shell-shield.sh watch              (wordt door systemd gestart)
 #    php2shell-shield.sh unban IP | bans
 #
@@ -44,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.5"
+VERSION="1.2.6"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -763,14 +765,35 @@ da_rewrite_confs() {
   sleep 2
 }
 
-# configtest_ok FUNCTIE PATROON : herhaal de configtest tot 5x met 3 s pauze
+# configtest_ok FUNCTIE PATROON [POGINGEN] : herhaal de configtest (standaard 5x, 3 s pauze)
 configtest_ok() {
-  local n=0
-  while [ $n -lt 5 ]; do
+  local n=0 max="${3:-5}"
+  while [ $n -lt "$max" ]; do
     "$1" 2>&1 | grep -qi "$2" && return 0
     n=$((n+1)); sleep 3
   done
   return 1
+}
+
+# verwijzen gegenereerde webserverconfigs (DirectAdmin-users, Plesk-vhosts) nog naar onze
+# include-bestanden? Zolang dat zo is, mogen die bestanden niet weg (anders start nginx/Apache niet)
+shield_refs_remaining() {
+  local f
+  if [ "$HAVE_NGINX" = 1 ] && nginx -T 2>/dev/null | grep -q 'php2shell-shield/nginx-'; then return 0; fi
+  if [ "$HAVE_APACHE" = 1 ]; then
+    { case "$APACHE_BIN" in apache2) apache2ctl -t -D DUMP_INCLUDES ;; *) httpd -t -D DUMP_INCLUDES ;; esac; } 2>/dev/null \
+      | grep -q 'php2shell-shield/apache-' && return 0
+  fi
+  for f in /usr/local/directadmin/data/users/*/nginx.conf /usr/local/directadmin/data/users/*/httpd.conf \
+           /etc/nginx/plesk.conf.d/vhosts/*.conf /etc/httpd/conf/plesk.conf.d/vhosts/*.conf /etc/apache2/plesk.conf.d/vhosts/*.conf; do
+    [ -f "$f" ] && grep -q 'php2shell-shield' "$f" && return 0
+  done
+  return 1
+}
+wait_no_shield_refs() {   # tot 2 minuten wachten tot DirectAdmin/Plesk klaar is met herschrijven
+  local i=0
+  while shield_refs_remaining && [ $i -lt 40 ]; do sleep 3; i=$((i+1)); done
+  ! shield_refs_remaining
 }
 plesk_mark_domain() {   # $1 = /var/www/vhosts/system/DOMEIN/conf
   local dom; dom=$(basename "$(dirname "$1")")
@@ -1169,7 +1192,7 @@ listen_ports() {   # poorten van apache/nginx/lsws, zonder paneel-/adminpoorten
 }
 
 do_test() {
-  local hosts h p scheme ip code_get code_mp fails=0 total=0 ips port_list resolve
+  local hosts h p scheme ip code_get code_mp fails=0 total=0 ips port_list resolve out effhost
   command -v curl >/dev/null 2>&1 || { warn "curl ontbreekt; test overgeslagen"; return 0; }
   hr; say "Zelftest: multipart-POST moet 403 geven, gewone GET niet (redirects worden gevolgd, op de server zelf)"
   hosts=$(test_hosts | sort -u)
@@ -1183,10 +1206,13 @@ do_test() {
         resolve="--resolve $h:$p:$ip --resolve $h:80:$ip --resolve $h:443:$ip"
         code_get=$(curl -sk -o /dev/null -m 10 -L --max-redirs 5 $resolve -w '%{http_code}' "$scheme://$h:$p/" 2>/dev/null) || code_get="000"
         [ "$code_get" = "000" ] && continue
-        code_mp=$(curl -sk -o /dev/null -m 10 -L --max-redirs 5 --post301 --post302 --post303 $resolve -w '%{http_code}' \
-                  -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || code_mp="000"
+        out=$(curl -sk -o /dev/null -m 10 -L --max-redirs 5 --post301 --post302 --post303 $resolve -w '%{http_code} %{url_effective}' \
+                  -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || out="000 -"
+        code_mp="${out%% *}"; effhost=$(printf '%s' "${out#* }" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
         total=$((total+1))
-        if [ "$MODE" = strict ] && [ "$code_mp" != 403 ]; then
+        if [ "$MODE" = strict ] && [ "$code_mp" != 403 ] && [ -n "$effhost" ] && [ "$effhost" != "$h" ] && [ "$effhost" != "www.$h" ]; then
+          printf '  %s%-34s %-5s GET=%s multipart=%s  (doorverwezen naar %s, buiten deze test)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$effhost" "$C_OFF"
+        elif [ "$MODE" = strict ] && [ "$code_mp" != 403 ]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"; fails=$((fails+1))
         elif [ "$code_get" = 403 ]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  <-- GET geeft ook 403 (controleer!)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"
@@ -1361,7 +1387,7 @@ do_status() {
 #  install / reapply / uninstall
 # =============================================================================
 apply_all() {
-  local apache_ok=0
+  local apache_ok=0 tries=5
   mkdir -p "$SHIELD_DIR" "$LOG_DIR"
   [ "$DRY_RUN" = 1 ] || touch "$BLOCK_LOG"
 
@@ -1386,11 +1412,13 @@ apply_all() {
   # --- herschrijven en herladen ---
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
+  # DirectAdmin 1.7x en Plesk herschrijven asynchroon: tot 2 minuten wachten op een geldige config
+  { [ "$NEED_DA_REWRITE" = 1 ] || [ "$NEED_PLESK_RECONFIGURE" = 1 ]; } && tries=40
   if [ "$HAVE_APACHE" = 1 ] && { [ "$CHANGED_APACHE" = 1 ] || [ "$CHANGED_PHP" = 1 ] || [ "$NEED_DA_REWRITE" = 1 ]; }; then
-    if [ "$DRY_RUN" = 1 ] || configtest_ok apache_configtest 'syntax ok'; then apache_reload && ok "Apache herladen"; else err "Apache-configtest faalt NA de wijzigingen; niet herladen! Draai: $APACHE_BIN -t"; fi
+    if [ "$DRY_RUN" = 1 ] || configtest_ok apache_configtest 'syntax ok' "$tries"; then apache_reload && ok "Apache herladen"; else err "Apache-configtest faalt NA de wijzigingen; niet herladen! Draai: $APACHE_BIN -t"; fi
   fi
   if [ "$HAVE_NGINX" = 1 ] && { [ "$CHANGED_NGINX" = 1 ] || [ "$NEED_DA_REWRITE" = 1 ] || [ "$NEED_PLESK_RECONFIGURE" = 1 ]; }; then
-    if [ "$DRY_RUN" = 1 ] || configtest_ok nginx_configtest 'syntax is ok'; then nginx_reload && ok "nginx herladen"; else err "nginx-configtest faalt NA de wijzigingen; niet herladen! Draai: nginx -t (en daarna: systemctl reload nginx)"; fi
+    if [ "$DRY_RUN" = 1 ] || configtest_ok nginx_configtest 'syntax is ok' "$tries"; then nginx_reload && ok "nginx herladen"; else err "nginx-configtest faalt NA de wijzigingen; niet herladen! Draai: nginx -t (en daarna: systemctl reload nginx)"; fi
   fi
   if { [ "$HAVE_OLS" = 1 ] || [ "$HAVE_LSWS" = 1 ]; } && { [ "$CHANGED_LSWS" = 1 ] || [ "$NEED_DA_REWRITE" = 1 ]; }; then lsws_restart; ok "LiteSpeed herstart"; fi
   [ "$CHANGED_PHP" = 1 ] && php_reload_all
@@ -1474,15 +1502,30 @@ do_uninstall() {
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
   if [ "$RESTORE_PHP_INI" = 1 ]; then info "php.ini's herstellen uit backup..."; php_restore; else say "php.ini-hardening (upload_progress=Off) blijft staan; gebruik --restore-php-ini om ook dat terug te draaien."; fi
-  if [ "$HAVE_APACHE" = 1 ]; then configtest_ok apache_configtest 'syntax ok' && apache_reload && ok "Apache herladen" || err "Apache-configtest faalt; controleer $APACHE_BIN -t"; fi
-  if [ "$HAVE_NGINX" = 1 ]; then configtest_ok nginx_configtest 'syntax is ok' && nginx_reload && ok "nginx herladen" || err "nginx-configtest faalt; controleer nginx -t"; fi
+  if [ "$HAVE_APACHE" = 1 ]; then configtest_ok apache_configtest 'syntax ok' 40 && apache_reload && ok "Apache herladen" || err "Apache-configtest faalt; controleer $APACHE_BIN -t"; fi
+  if [ "$HAVE_NGINX" = 1 ]; then configtest_ok nginx_configtest 'syntax is ok' 40 && nginx_reload && ok "nginx herladen" || err "nginx-configtest faalt; controleer nginx -t"; fi
   { [ "$HAVE_OLS" = 1 ] || [ "$HAVE_LSWS" = 1 ]; } && lsws_restart
   [ "$CHANGED_PHP" = 1 ] && php_reload_all
   if [ "$DRY_RUN" = 0 ]; then
-    run rm -f "$SHIELD_DIR"/apache-server.conf "$SHIELD_DIR"/apache-vhost.conf "$SHIELD_DIR"/nginx-http.conf "$SHIELD_DIR"/nginx-server.conf "$SHIELD_DIR"/modsecurity-rules.conf "$SHIELD_DIR"/rewrite-rules.txt "$STATE_FILE"
-    run rm -f "$BIN_TARGET"
+    rm -f "$SHIELD_DIR"/modsecurity-rules.conf "$SHIELD_DIR"/rewrite-rules.txt "$STATE_FILE"
+    do_cleanup
   fi
   ok "Verwijderd. Backups en lijsten staan nog in $SHIELD_DIR (backups/), logs in $LOG_DIR."
+}
+
+# cleanup: verwijder de include-bestanden en het script pas als geen gegenereerde config er
+# nog naar verwijst; anders leegmaken en laten staan (een lege include is geldig)
+do_cleanup() {
+  local f
+  if wait_no_shield_refs; then
+    rm -f "$SHIELD_DIR"/apache-server.conf "$SHIELD_DIR"/apache-vhost.conf "$SHIELD_DIR"/nginx-http.conf "$SHIELD_DIR"/nginx-server.conf
+    rm -f "$BIN_TARGET"
+    ok "Include-bestanden en $BIN_TARGET verwijderd; geen config verwijst er nog naar."
+  else
+    for f in apache-server.conf apache-vhost.conf nginx-http.conf nginx-server.conf; do [ -f "$SHIELD_DIR/$f" ] && : > "$SHIELD_DIR/$f"; done
+    warn "Gegenereerde webserverconfigs verwijzen nog naar $SHIELD_DIR/*.conf (DirectAdmin/Plesk nog bezig met herschrijven?)."
+    warn "Die bestanden zijn leeggemaakt en blijven staan zodat nginx/Apache blijven starten. Draai straks: php2shell-shield cleanup"
+  fi
 }
 
 usage() {
@@ -1525,6 +1568,7 @@ main() {
     install)     do_install ;;
     reapply)     do_reapply ;;
     uninstall)   do_uninstall ;;
+    cleanup)     need_root; detect_env; do_cleanup ;;
     status)      need_root; detect_env; do_status ;;
     test)        need_root; detect_env; load_state || true; do_test; [ -n "$PROBE_DOMAIN" ] && do_probe "$PROBE_DOMAIN"; true ;;
     scan)        need_root; detect_env; load_state || true; do_scan ;;
