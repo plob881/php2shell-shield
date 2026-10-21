@@ -1,0 +1,6 @@
+# Kopieer dit bestand naar servers.txt en vul je servers in, één per regel.
+# Vormen: host | user@host | host:poort | user@host:poort   (regels met # worden genegeerd)
+#
+# da1.voorbeeld-hosting.nl
+# root@plesk2.voorbeeld-hosting.nl
+# 89.200.202.39:2222

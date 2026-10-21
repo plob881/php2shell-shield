@@ -1,0 +1,4 @@
+# lokale serverlijst en uitrol-logs horen niet in git
+servers.txt
+uitrol-*.log
+*.zip

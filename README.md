@@ -1,0 +1,193 @@
+# php2shell-shield — serverbrede noodblokkade voor PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
+
+Eén script dat je op elke server draait (DirectAdmin, Plesk, cPanel of kaal
+Apache/nginx/LiteSpeed) en dat in één keer **alle websites** op die server
+afschermt, totdat PHP overal gepatcht is.
+
+## Waarom dit werkt terwijl per-site maatregelen niet werken
+
+Beide CVE's zitten in de manier waarop PHP zelf een `multipart/form-data`-body
+verwerkt. Dat gebeurt **vóórdat** ook maar één regel applicatiecode draait:
+WordPress-logins, CSRF-checks, security-plugins, maintenance mode, `.htaccess`
+met `php_flag` enz. komen allemaal te laat. De enige plek waar je zo'n verzoek
+tegenhoudt vóór PHP is de **webserver** (of een WAF/proxy daarvoor).
+
+Het script legt daarom drie lagen over de hele server heen:
+
+| Laag | Wat | Waar |
+|------|-----|------|
+| 1. Webserver | Elk verzoek met `Content-Type: multipart/...` krijgt 403, ongeacht methode, pad of site. Vertrouwde IP's (`--trust`) en een optionele hostlijst (`--scope`) vallen erbuiten. | Apache: globale `<If>`-regel met `Require all denied` (servercontext, geldt voor alle vhosts). nginx: `map` + `if ... return 403` in elk `server{}`-blok via de officiële DirectAdmin-tokens / Plesk `vhost_nginx.conf`. OpenLiteSpeed/LiteSpeed: rewrite-regel via DirectAdmin-token. |
+| 2. PHP | `session.upload_progress.enabled = Off` in álle php.ini's (DirectAdmin `/usr/local/php*/lib/php.ini`, Plesk `/opt/plesk/php/*/etc/php.ini`, OS-PHP, Remi, cPanel, CloudLinux, lsphp, Plesk-paneel) plus een drop-in `99-php2shell-shield.ini` in elke `php.conf.d`/`php.d`/`conf.d`. Daarna worden alle PHP-FPM-diensten herladen. Dit is de tot nu toe bekende aanvalsroute; onderzoekers zeggen dat dit alléén niet volstaat, daarom laag 1. | overal |
+| 3. Watch-service | Elk geblokkeerd verzoek wordt centraal gelogd (`/var/log/php2shell-shield/blocked.log`). Een systemd-service leest dat log en zet IP's die binnen 5 minuten op 8 of meer verschillende hosts multipart afvuren (scanner-gedrag) 1 uur in de firewall (CSF, anders ipset/iptables, anders nftables). Cloudflare-ranges, privé-adressen, de eigen server-IP's en `--trust`-adressen worden nooit gebant. De service past elke 5 minuten ook de configuratie opnieuw toe (nieuwe Plesk-domeinen krijgen de include). | `php2shell-watch.service` |
+
+Daarnaast: ModSecurity-regels (ID 99901–99904) die het bekende exploitpatroon
+(`PHP_SESSION_UPLOAD_PROGRESS`-veld, misvormde multipart-bodies) blokkeren waar
+ModSecurity 2 in Apache draait, een zelftest met curl, een statusoverzicht met
+patchstand per PHP-binary, en een volledige `uninstall`.
+
+## Snel starten (per server, als root)
+
+```bash
+# 1. kijk eerst wat er zou gebeuren
+bash php2shell-shield.sh install --dry-run --trust JOUW.KANTOOR.IP
+
+# 2. echt installeren (strict = alle multipart-verzoeken blokkeren)
+bash php2shell-shield.sh install --trust JOUW.KANTOOR.IP
+
+# 3. controleren
+php2shell-shield status
+php2shell-shield test --probe klantdomein.nl      # leest de echte PHP-instelling via HTTP
+tail -f /var/log/php2shell-shield/blocked.log
+```
+
+Met `--trust` geef je de IP's/CIDR's op (komma-gescheiden) die wél multipart
+mogen blijven sturen, bijvoorbeeld je kantoor of een monitoringsysteem. Geef
+**niet** 127.0.0.1 of het server-IP op: dan kan de zelftest de blokkade niet
+meer aantonen.
+
+## Alle servers in één keer
+
+Zet je servers in `servers.txt` (zie `servers.txt.voorbeeld`) en draai vanuit
+deze map:
+
+```bash
+# Git Bash (Windows) / Linux / macOS
+./uitrollen.sh "install --dry-run --trust JOUW.KANTOOR.IP"
+./uitrollen.sh "install --trust JOUW.KANTOOR.IP"
+./uitrollen.sh status
+```
+
+```powershell
+# Windows PowerShell
+.\uitrollen.ps1 "install --dry-run --trust JOUW.KANTOOR.IP"
+.\uitrollen.ps1 "install --trust JOUW.KANTOOR.IP"
+.\uitrollen.ps1 status
+```
+
+Het script gaat via ssh-stdin naar `/root/php2shell-shield.sh` (geen SFTP
+nodig) en wordt daar gestart. Elke uitrol schrijft een logbestand in deze map.
+
+## Wat breekt er in strict-mode, en wat zijn de alternatieven
+
+Strict blokkeert elk `multipart/form-data`-verzoek, dus tijdelijk vallen uit:
+
+- bestandsuploads (WordPress-media, plugin-/thema-zips, Roundcube-bijlagen,
+  phpMyAdmin-import, productafbeeldingen in webshops);
+- formulieren die `FormData` of `enctype="multipart/form-data"` gebruiken,
+  ook zonder bestand: **Contact Form 7, Gravity Forms, WPForms, Fluent Forms**.
+
+Gewone formulieren (`x-www-form-urlencoded`), logins, JSON/REST-verkeer,
+WooCommerce-checkout, Elementor-opslag en alle GET-verkeer blijven werken. De
+bezoeker krijgt bij een geblokkeerd verzoek een leesbare 403-melding.
+
+Alternatieven, in oplopend risico:
+
+| Mode / optie | Beschermt tegen | Nadeel |
+|---|---|---|
+| `--mode strict` (standaard) | beide CVE's, ook de onbekende tweede route | uploads/FormData-formulieren uit |
+| `--mode strict --scope BESTAND` | alleen de hosts in het bestand (incl. hun subdomeinen) | andere sites zijn open |
+| `--mode monitor` | niets; logt alleen welke multipart-verzoeken er zijn | meetinstrument vooraf: hoeveel klanten raak je? |
+| `--mode signature` | alleen het bekende patroon (upload-progress-veld), via php.ini + ModSecurity | tweede route blijft open; ModSecurity moet draaien |
+
+Aanbevolen volgorde: nu overal **strict**; zodra je servers gepatcht zijn
+`php2shell-shield status` draaien en de blokkade beperken tot de sites die op
+een PHP-versie zonder fix draaien:
+
+```bash
+php2shell-shield eol-domains > /etc/php2shell-shield/scope.txt   # DirectAdmin/Plesk: alle sites op PHP < 8.2
+php2shell-shield install --scope /etc/php2shell-shield/scope.txt --trust JOUW.KANTOOR.IP
+```
+
+## Zodra de PHP-patch beschikbaar is
+
+PHP brengt de fix op 21 oktober 2026 14:00 UTC uit voor de takken 8.2, 8.3,
+8.4 en 8.5 (verwacht: 8.2.35, 8.3.36, 8.4.27, 8.5.12; controleer php.net).
+**PHP 8.1 en ouder krijgen geen fix.** De paneelpakketten lopen uren tot dagen
+achter op php.net.
+
+- **DirectAdmin (CustomBuild):**
+  `cd /usr/local/directadmin/custombuild && ./build update && ./build versions`
+  toont zodra de nieuwe versies beschikbaar zijn; dan `./build php n`.
+- **Plesk:** de fix komt in de Plesk-PHP-pakketten (Tools & Settings > Updates,
+  of `apt-get update && apt-get install --only-upgrade 'plesk-php*'` /
+  `dnf upgrade 'plesk-php*'`). Vergeet de OS-PHP (`php-fpm`/`php8.x-fpm`) en de
+  PHP van het paneel zelf niet.
+- **Kaal Debian/Ubuntu/RHEL:** `apt`/`dnf` zodra de distributie of Sury/Remi
+  levert (Remi heeft aangekondigd niet op de releasedag te leveren).
+
+Daarna:
+
+```bash
+php2shell-shield status      # per binary: OK / ONGEPATCHT / EOL
+php2shell-shield uninstall   # pas als alles OK is; php.ini-hardening blijft staan
+php2shell-shield uninstall --restore-php-ini   # ook de php.ini's terugzetten
+```
+
+Zijn de officiële versienummers anders dan verwacht, geef ze dan mee:
+`php2shell-shield status --fixed "8.2.35,8.3.36,8.4.27,8.5.12"`.
+
+## Watch-service en bans
+
+```bash
+systemctl status php2shell-watch
+php2shell-shield bans              # banlog
+php2shell-shield unban 203.0.113.9 # IP vrijgeven (csf/ipset/nft/iptables)
+```
+
+Drempels bij install: `--ban-hosts 8` (verschillende hosts), `--ban-count 0`
+(absoluut aantal, uit), `--ban-window 300`, `--ban-ttl 3600`. IPv6-adressen
+worden gelogd maar niet gebant. Met `--no-watch` sla je de service over.
+
+## Wat het script precies aanraakt (en terugdraait)
+
+Alles staat in `/etc/php2shell-shield/` (gegenereerde configs, `state.conf`,
+`backups/` met een kopie van elk aangeraakt bestand, lijsten van aangemaakte en
+gewijzigde bestanden). Wijzigingen in bestaande bestanden staan altijd tussen
+`# >>> php2shell-shield >>>` en `# <<< php2shell-shield <<<`.
+
+| Omgeving | Webserver-haak | Wordt herschreven met |
+|---|---|---|
+| DirectAdmin + Apache | `/etc/httpd/conf/extra/httpd-includes.conf` (globaal; valt terug op token `custom/cust_httpd.CUSTOM.1.pre`) | `action=rewrite&value=httpd` in de task.queue |
+| DirectAdmin + nginx / nginx_apache | `/etc/nginx/nginx-includes.conf` (http) + `custom/cust_nginx.CUSTOM.post` (server) | idem |
+| DirectAdmin + OpenLiteSpeed | `custom/cust_openlitespeed.CUSTOM.5.pre` (rewrite-sectie) | idem + `lswsctrl restart` |
+| DirectAdmin + LiteSpeed Enterprise | `custom/cust_httpd.CUSTOM.1.pre` met rewrite-regels | idem |
+| Plesk | `/etc/httpd/conf.d/zz-php2shell-shield.conf` of `/etc/apache2/conf-available/...` (Apache, globaal), `/etc/nginx/conf.d/zz-php2shell-shield.conf` (http) + `/var/www/vhosts/system/*/conf/vhost_nginx.conf` (server) | `plesk sbin httpdmng --reconfigure-all` (nieuwe domeinen later per domein) |
+| cPanel | `/etc/apache2/conf.d/includes/pre_main_global.conf`, `/etc/nginx/conf.d/server-includes/` | – |
+| Kaal | `conf.d`/`conf-available` (Apache), `conf.d` + include-regel na elke `server {` (nginx) | – |
+
+Voor elke wijziging wordt `httpd -t` / `nginx -t` gedraaid; faalt dat, dan wordt
+de wijziging teruggedraaid en niets herladen. `uninstall` verwijdert de haken,
+de service, de firewallsets en de logrotate-regel, en laat de backups staan.
+
+## Kanttekeningen die je moet kennen
+
+- **De technische details zijn nog onder embargo.** Dat het blokkeren van
+  multipart beide CVE's volledig afdekt is de breed gedragen inschatting van
+  onderzoekers (PHP verwerkt multipart vóór alle applicatiecode), geen officiële
+  garantie. Patchen blijft de echte oplossing; dit koopt tijd.
+- **Het Plesk-paneel zelf (poort 8443/8880) draait ook PHP** en valt buiten
+  deze blokkade. Beperk die poorten in de firewall tot je eigen IP's; Plesks
+  eigen "beperk administratieve toegang" zit in PHP en is dus te laat.
+  DirectAdmin zelf is geen PHP; de webapps eronder (Roundcube, phpMyAdmin)
+  vallen wél onder de blokkade.
+- **Cloudflare:** heeft noodregels uitgerold, maar beschermt alleen sites die
+  via Cloudflare lopen én alleen als het origin-IP niet rechtstreeks
+  bereikbaar is. Deze blokkade werkt juist op het origin.
+- **Imunify360:** ruleset 8.83+ bevat een regel voor het publieke exploit;
+  update met `imunify360-agent update --force modsec-rules`.
+- **Per-site overrides:** `.user.ini`/`.htaccess` kunnen upload_progress weer
+  aanzetten; `php2shell-shield scan` zoekt die, plus FPM-segfaults, verdachte
+  shells onder PHP en recent gewijzigde PHP-bestanden.
+- **EOL-PHP (≤ 8.1)** krijgt geen fix: laat voor die sites de blokkade staan
+  (`--scope`) of migreer ze.
+
+## Bronnen
+
+- PHP-aankondiging: https://www.php.net/archive/2026.php (20 okt 2026)
+- watchTowr FAQ: https://watchtowr.com/intelligence/php-cve-2026-109618-faq/
+- Mitigaties, getest: https://ma.ttias.be/php-cve-2026-109618-early-mitigation/
+- Overzicht: https://www.vincentschmalbach.com/cve-2026-109618-and-cve-2026-109619-what-you-should-do-now/
+- Sansec (PHP2Shell): https://sansec.io/research/php2shell
+- Huntress: https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities
+- Plesk-forum: https://talk.plesk.com/threads/eta-for-critical-php-security-updates-cve-2026-109618-cve-2026-109619.395516/
+- DirectAdmin-docs (custom tokens): https://docs.directadmin.com/webservices/apache/customizing.html
