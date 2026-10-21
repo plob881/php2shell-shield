@@ -44,7 +44,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -971,7 +971,7 @@ WantedBy=multi-user.target" >/dev/null || true
   [ "$DRY_RUN" = 1 ] && return 0
   systemctl daemon-reload
   systemctl enable --now "$UNIT_NAME" >/dev/null 2>&1 && systemctl restart "$UNIT_NAME" >/dev/null 2>&1
-  ok "Watch-service actief ($UNIT_NAME): ban na >= $BAN_HOSTS hosts${BAN_COUNT:+ of $BAN_COUNT verzoeken} binnen ${BAN_WINDOW}s, ttl ${BAN_TTL}s"
+  ok "Watch-service actief ($UNIT_NAME): ban na >= $(effective_ban_hosts) verschillende hosts binnen ${BAN_WINDOW}s (server heeft $(server_host_count) domeinen, max $BAN_HOSTS)$([ "$BAN_COUNT" -gt 0 ] && printf ' of %s verzoeken' "$BAN_COUNT"), ttl ${BAN_TTL}s"
 }
 
 remove_watch() {
@@ -988,6 +988,27 @@ NEVER_BAN_V4="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16
 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18
 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13
 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
+# aantal domeinen op deze server (voor een drempel die past bij kleine servers)
+server_host_count() {
+  local n=0
+  case "$PANEL" in
+    directadmin) n=$(awk 'END{print NR}' /etc/virtual/domainowners 2>/dev/null) ;;
+    plesk)       n=$(ls -1 /var/www/vhosts/system 2>/dev/null | wc -l) ;;
+    cpanel)      n=$(grep -vc '^\*' /etc/userdomains 2>/dev/null) ;;
+  esac
+  echo "${n:-0}"
+}
+# effectieve ban-drempel: BAN_HOSTS, maar op een server met minder domeinen
+# driekwart daarvan (minimaal 3), anders haalt een scanner de drempel nooit
+effective_ban_hosts() {
+  local n e; n=$(server_host_count)
+  [ "$n" -gt 0 ] || { echo "$BAN_HOSTS"; return; }   # aantal onbekend (kaal systeem): vaste drempel
+  e=$(( (n * 3 + 3) / 4 ))
+  [ "$e" -lt 3 ] && e=3
+  [ "$e" -gt "$BAN_HOSTS" ] && e=$BAN_HOSTS
+  echo "$e"
+}
+
 never_ban() {
   local ip="$1" c
   is_ipv4 "$ip" || return 0        # IPv6 wordt (bewust) niet gebant
@@ -1049,15 +1070,14 @@ watch_loop() {
   load_state || true
   mkdir -p "$LOG_DIR"; touch "$BLOCK_LOG"
   declare -A ip_first ip_count ip_hosts ip_banned
-  local ts ip host rest now h nh last_maint
-  last_maint=$(date +%s)
-  logger -t php2shell-shield "watch gestart (ban_hosts=$BAN_HOSTS ban_count=$BAN_COUNT window=${BAN_WINDOW}s ttl=${BAN_TTL}s)" 2>/dev/null || true
+  local ts ip host rest now h nh last_maint eff
+  last_maint=$(date +%s); eff=$(effective_ban_hosts)
+  logger -t php2shell-shield "watch gestart (ban bij >= $eff hosts, max $BAN_HOSTS; ban_count=$BAN_COUNT window=${BAN_WINDOW}s ttl=${BAN_TTL}s)" 2>/dev/null || true
   exec 3< <(tail -n 0 -F "$BLOCK_LOG" 2>/dev/null)
   while true; do
     if read -r -t 30 -u 3 ts ip host rest; then
       [ -n "${ip:-}" ] || continue
       [ -n "${ip_banned[$ip]:-}" ] && continue
-      never_ban "$ip" && continue
       now=$(date +%s)
       if [ -z "${ip_first[$ip]:-}" ] || [ $(( now - ip_first[$ip] )) -gt "$BAN_WINDOW" ]; then
         ip_first[$ip]=$now; ip_count[$ip]=0; ip_hosts[$ip]=" "
@@ -1066,14 +1086,19 @@ watch_loop() {
       h="${host%%:*}"; h="${h,,}"
       case "${ip_hosts[$ip]}" in *" $h "*) ;; *) ip_hosts[$ip]="${ip_hosts[$ip]}$h " ;; esac
       nh=$(printf '%s' "${ip_hosts[$ip]}" | wc -w)
-      if [ "$nh" -ge "$BAN_HOSTS" ] || { [ "$BAN_COUNT" -gt 0 ] && [ "${ip_count[$ip]}" -ge "$BAN_COUNT" ]; }; then
-        ban_ip "$ip" "multipart op $nh host(s), ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s"
+      if [ "$nh" -ge "$eff" ] || { [ "$BAN_COUNT" -gt 0 ] && [ "${ip_count[$ip]}" -ge "$BAN_COUNT" ]; }; then
+        if never_ban "$ip"; then
+          # privé-/vertrouwd/Cloudflare/eigen adres: wel melden, niet bannen (zelftest via loopback niet)
+          case "$ip" in 127.*) ;; *) echo "$(date -Is) SKIP $ip multipart op $nh host(s), ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s - niet gebant (privé/vertrouwd/Cloudflare/eigen IP); zoek uit wie dit is" >> "$BAN_LOG" ;; esac
+        else
+          ban_ip "$ip" "multipart op $nh host(s), ${ip_count[$ip]} verzoeken in ${BAN_WINDOW}s"
+        fi
         ip_banned[$ip]=1
       fi
     fi
     now=$(date +%s)
     if [ $(( now - last_maint )) -ge 300 ]; then
-      last_maint=$now
+      last_maint=$now; eff=$(effective_ban_hosts)
       QUIET=1 "$BIN_TARGET" reapply >/dev/null 2>&1 || true
     fi
   done
@@ -1273,10 +1298,13 @@ do_status() {
     say "Watch-service: $(systemctl is-active $UNIT_NAME 2>/dev/null || echo inactief)"
   fi
   if [ -f "$BLOCK_LOG" ]; then
-    hr; say "Geblokkeerd/gelogd: $(wc -l < "$BLOCK_LOG") regels totaal; top-IP's (laatste 5000):"
-    tail -n 5000 "$BLOCK_LOG" | awk '{print $2}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /'
+    hr; say "Geblokkeerd/gelogd: $(wc -l < "$BLOCK_LOG") regels totaal; top-IP's (laatste 5000; 127.0.0.1 = zelftest):"
+    tail -n 5000 "$BLOCK_LOG" | awk '{print $2}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /; s/127\.0\.0\.1$/127.0.0.1 (zelftest)/'
+    say "IP's naar aantal verschillende hosts (scanner-indicatie; ban bij >= $(effective_ban_hosts) hosts binnen ${BAN_WINDOW}s, privé-/vertrouwde adressen nooit):"
+    tail -n 5000 "$BLOCK_LOG" | awk '{split($3,a,":"); print $2, tolower(a[1])}' | sort -u | awk '{c[$1]++} END{for (i in c) print c[i], i}' | sort -rn | head -10 | sed 's/^/  /'
     say "Top-hosts (laatste 5000):"
     tail -n 5000 "$BLOCK_LOG" | awk '{print $3}' | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /'
+    say "Details van één IP: grep IP $BLOCK_LOG"
   fi
   [ -f "$BAN_LOG" ] && { hr; say "Bans (laatste 10):"; tail -n 10 "$BAN_LOG" | sed 's/^/  /'; }
   php_report
