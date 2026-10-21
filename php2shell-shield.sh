@@ -42,7 +42,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -780,13 +780,17 @@ php_dropin_dirs() {
     [ -d "$d" ] && echo "$d"
   done | sort -u
 }
+# Alle PHP-binaries (CLI en FPM). Symlinks worden opgelost en ontdubbeld:
+# DirectAdmin bouwt met --program-suffix (php81, php-fpm81) en linkt php -> php81.
 php_binaries() {
   local b
-  for b in /usr/local/php*/bin/php /usr/local/php*/sbin/php-fpm /opt/plesk/php/*/bin/php /opt/plesk/php/*/sbin/php-fpm \
+  for b in /usr/local/php*/bin/php /usr/local/php*/bin/php[0-9]* /usr/local/php*/sbin/php-fpm /usr/local/php*/sbin/php-fpm[0-9]* \
+           /opt/plesk/php/*/bin/php /opt/plesk/php/*/sbin/php-fpm \
            /usr/bin/php /usr/bin/php[0-9]* /usr/sbin/php-fpm /usr/sbin/php-fpm[0-9]* /opt/remi/php*/root/usr/bin/php \
            /opt/cpanel/ea-php*/root/usr/bin/php /opt/cpanel/ea-php*/root/usr/sbin/php-fpm /opt/alt/php*/usr/bin/php \
            /usr/local/lsws/lsphp*/bin/php /usr/local/lsws/lsphp*/bin/lsphp /usr/local/psa/admin/bin/php; do
-    [ -x "$b" ] && [ ! -L "$b" ] && echo "$b"
+    [ -x "$b" ] || continue
+    readlink -f "$b" 2>/dev/null || echo "$b"
   done | sort -u
 }
 
@@ -1186,9 +1190,10 @@ do_eol_domains() {
 #  Status
 # =============================================================================
 do_status() {
-  local f
+  local f state_ok=0
+  load_state && state_ok=1      # eerst de opgeslagen instellingen (mode/trust/scope), dan pas tonen
   print_env
-  if load_state; then
+  if [ "$state_ok" = 1 ]; then
     say "Geïnstalleerd: $(grep ^INSTALLED_AT= "$STATE_FILE" | cut -d= -f2-)  (v$(grep ^INSTALLED_VERSION= "$STATE_FILE" | cut -d= -f2-))"
   else
     warn "Niet geïnstalleerd (geen $STATE_FILE)"
