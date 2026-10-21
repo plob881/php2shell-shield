@@ -44,7 +44,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -750,10 +750,27 @@ lsws_restart() {
 #  DirectAdmin / Plesk herschrijven
 # =============================================================================
 da_rewrite_confs() {
+  local i=0
   [ "$DRY_RUN" = 1 ] && { say "  [dry-run] DirectAdmin: webserverconfigs herschrijven"; return 0; }
   info "DirectAdmin: webserverconfiguraties herschrijven (task.queue)..."
   echo "action=rewrite&value=httpd" >> /usr/local/directadmin/data/task.queue
   /usr/local/directadmin/dataskq d >/dev/null 2>&1 || true
+  # de cron-dataskq kan de taak al opgepakt hebben; wacht tot de queue leeg is en er
+  # geen dataskq meer draait (max 10 min), anders test je een half herschreven config
+  while { [ -s /usr/local/directadmin/data/task.queue ] || pgrep -x dataskq >/dev/null 2>&1; } && [ $i -lt 300 ]; do
+    sleep 2; i=$((i+1))
+  done
+  sleep 2
+}
+
+# configtest_ok FUNCTIE PATROON : herhaal de configtest tot 5x met 3 s pauze
+configtest_ok() {
+  local n=0
+  while [ $n -lt 5 ]; do
+    "$1" 2>&1 | grep -qi "$2" && return 0
+    n=$((n+1)); sleep 3
+  done
+  return 1
 }
 plesk_mark_domain() {   # $1 = /var/www/vhosts/system/DOMEIN/conf
   local dom; dom=$(basename "$(dirname "$1")")
@@ -1356,10 +1373,10 @@ apply_all() {
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
   if [ "$HAVE_APACHE" = 1 ] && { [ "$CHANGED_APACHE" = 1 ] || [ "$CHANGED_PHP" = 1 ] || [ "$NEED_DA_REWRITE" = 1 ]; }; then
-    if [ "$DRY_RUN" = 1 ] || apache_configtest | grep -qi 'syntax ok'; then apache_reload && ok "Apache herladen"; else err "Apache-configtest faalt NA de wijzigingen; niet herladen! Draai: $APACHE_BIN -t"; fi
+    if [ "$DRY_RUN" = 1 ] || configtest_ok apache_configtest 'syntax ok'; then apache_reload && ok "Apache herladen"; else err "Apache-configtest faalt NA de wijzigingen; niet herladen! Draai: $APACHE_BIN -t"; fi
   fi
   if [ "$HAVE_NGINX" = 1 ] && { [ "$CHANGED_NGINX" = 1 ] || [ "$NEED_DA_REWRITE" = 1 ] || [ "$NEED_PLESK_RECONFIGURE" = 1 ]; }; then
-    if [ "$DRY_RUN" = 1 ] || nginx_configtest | grep -qi 'syntax is ok'; then nginx_reload && ok "nginx herladen"; else err "nginx-configtest faalt NA de wijzigingen; niet herladen! Draai: nginx -t"; fi
+    if [ "$DRY_RUN" = 1 ] || configtest_ok nginx_configtest 'syntax is ok'; then nginx_reload && ok "nginx herladen"; else err "nginx-configtest faalt NA de wijzigingen; niet herladen! Draai: nginx -t (en daarna: systemctl reload nginx)"; fi
   fi
   if { [ "$HAVE_OLS" = 1 ] || [ "$HAVE_LSWS" = 1 ]; } && { [ "$CHANGED_LSWS" = 1 ] || [ "$NEED_DA_REWRITE" = 1 ]; }; then lsws_restart; ok "LiteSpeed herstart"; fi
   [ "$CHANGED_PHP" = 1 ] && php_reload_all
@@ -1443,8 +1460,8 @@ do_uninstall() {
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
   if [ "$RESTORE_PHP_INI" = 1 ]; then info "php.ini's herstellen uit backup..."; php_restore; else say "php.ini-hardening (upload_progress=Off) blijft staan; gebruik --restore-php-ini om ook dat terug te draaien."; fi
-  if [ "$HAVE_APACHE" = 1 ]; then apache_configtest | grep -qi 'syntax ok' && apache_reload && ok "Apache herladen" || err "Apache-configtest faalt; controleer $APACHE_BIN -t"; fi
-  if [ "$HAVE_NGINX" = 1 ]; then nginx_configtest | grep -qi 'syntax is ok' && nginx_reload && ok "nginx herladen" || err "nginx-configtest faalt; controleer nginx -t"; fi
+  if [ "$HAVE_APACHE" = 1 ]; then configtest_ok apache_configtest 'syntax ok' && apache_reload && ok "Apache herladen" || err "Apache-configtest faalt; controleer $APACHE_BIN -t"; fi
+  if [ "$HAVE_NGINX" = 1 ]; then configtest_ok nginx_configtest 'syntax is ok' && nginx_reload && ok "nginx herladen" || err "nginx-configtest faalt; controleer nginx -t"; fi
   { [ "$HAVE_OLS" = 1 ] || [ "$HAVE_LSWS" = 1 ]; } && lsws_restart
   [ "$CHANGED_PHP" = 1 ] && php_reload_all
   if [ "$DRY_RUN" = 0 ]; then
