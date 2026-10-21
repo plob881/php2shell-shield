@@ -215,8 +215,9 @@ De paneelpakketten lopen uren tot dagen achter op php.net.
 ### Eerst kijken: levert CustomBuild de backport al zelf?
 
 DirectAdmin onderhoudt voor EOL-versies eigen beveiligingspatches in
-`/usr/local/directadmin/custombuild/patches/php-<versie>/`, en voor 7.4 zit
-daar sinds 21 oktober 2026 een `143-php-7.4-cve-2026-109618.patch` bij. Op een
+`/usr/local/directadmin/custombuild/patches/php-<versie>/`, en sinds
+21 oktober 2026 zit daar voor 5.6, 7.3, 7.4, 8.0 én 8.1 een
+`*-cve-2026-109618.patch` bij (voor 7.4 bijvoorbeeld nummer 143). Op een
 server met een actuele licentie is een eigen tarball dan niet nodig en zelfs
 onhandig (de DirectAdmin-patches botsen met de branch). Controleer het zo:
 
