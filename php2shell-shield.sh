@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.6"
+VERSION="1.2.7"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -1206,12 +1206,15 @@ do_test() {
         resolve="--resolve $h:$p:$ip --resolve $h:80:$ip --resolve $h:443:$ip"
         code_get=$(curl -sk -o /dev/null -m 10 -L --max-redirs 5 $resolve -w '%{http_code}' "$scheme://$h:$p/" 2>/dev/null) || code_get="000"
         [ "$code_get" = "000" ] && continue
-        out=$(curl -sk -o /dev/null -m 10 -L --max-redirs 5 --post301 --post302 --post303 $resolve -w '%{http_code} %{url_effective}' \
+        # multipart-POST zónder redirects volgen: een 3xx komt dan van de webserver zelf (Redirect/
+        # RewriteRule vóór de toegangscontrole), dus PHP heeft de body nooit gezien; de bestemming
+        # krijgt bij een eigen verzoek weer de blokkade. Een 2xx is wél een echt gat.
+        out=$(curl -sk -o /dev/null -m 10 $resolve -w '%{http_code} %{redirect_url}' \
                   -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || out="000 -"
         code_mp="${out%% *}"; effhost=$(printf '%s' "${out#* }" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
         total=$((total+1))
-        if [ "$MODE" = strict ] && [ "$code_mp" != 403 ] && [ -n "$effhost" ] && [ "$effhost" != "$h" ] && [ "$effhost" != "www.$h" ]; then
-          printf '  %s%-34s %-5s GET=%s multipart=%s  (doorverwezen naar %s, buiten deze test)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$effhost" "$C_OFF"
+        if [ "$MODE" = strict ] && [ "$code_mp" != 403 ] && [[ "$code_mp" =~ ^30[12378]$ ]]; then
+          printf '  %s%-34s %-5s GET=%s multipart=%s  (redirect door de webserver vóór PHP, naar %s)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "${effhost:-?}" "$C_OFF"
         elif [ "$MODE" = strict ] && [ "$code_mp" != 403 ]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"; fails=$((fails+1))
         elif [ "$code_get" = 403 ]; then
