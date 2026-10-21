@@ -226,24 +226,33 @@ vervangt de binaries pas als de compilatie geslaagd is.
 cd /usr/local/directadmin/custombuild && ./build set php2_release no
 # 2. gereedschap voor ./buildconf (de git-branch bevat geen configure-script)
 dnf install -y autoconf bison re2c 2>/dev/null || apt-get install -y autoconf bison re2c
-# 3. backport ophalen, configure genereren, als tarball klaarzetten en de versie overrulen
+# 3. backport ophalen, configure genereren, als tarball in cache/ zetten en de versie overrulen
+#    LET OP: CustomBuild bouwt uitsluitend uit custombuild/cache/. Staat het tarball daar niet,
+#    dan downloadt het de officiële 8.1.34 (dec 2025, ZONDER de fix) en bouwt die, zonder
+#    de md5 uit custom_versions.txt te controleren. Het versienummer 8.1.34 bewijst dus niets.
 cd /usr/local/directadmin/custombuild \
  && curl -fsSL -o php-src-backport.tar.gz https://github.com/php/php-src/archive/refs/heads/PHP-8.1-CVE-2026-109618-109619.tar.gz \
  && rm -rf php-8.1.34 && mkdir php-8.1.34 && tar xzf php-src-backport.tar.gz -C php-8.1.34 --strip-components=1 \
  && (cd php-8.1.34 && ./buildconf --force) && tar czf php-8.1.34.tar.gz php-8.1.34 && rm -rf php-8.1.34 php-src-backport.tar.gz \
+ && mkdir -p cache && cp -f php-8.1.34.tar.gz cache/php-8.1.34.tar.gz \
  && echo "php81:8.1.34:$(md5sum php-8.1.34.tar.gz | cut -d' ' -f1)" > custom_versions.txt \
  && ./build versions | grep -A2 'PHP 8.1'          # moet 8.1.34 als nieuwste tonen
 # 4. alleen 8.1 bouwen (20-40 min); via nohup zodat een wegvallende VPN de build niet afbreekt
 nohup ./build php_expert 8.1 php-fpm > /root/php81-build.log 2>&1 &
 tail -f /root/php81-build.log
-# 5. controleren: 8.1.34 kan alleen uit jouw tarball komen
-/usr/local/php81/bin/php81 -v | head -1 && php2shell-shield status | grep php81
+# 5. controleren dat de fix er echt in zit: beide tellingen >= 1, md5 van cache/ gelijk aan
+#    custom_versions.txt, en een verse bouwdatum in php -v
+tar xzf cache/php-8.1.34.tar.gz -O php-8.1.34/Zend/zend_alloc.c | grep -c zend_mm_safe_error_ex
+tar xzf cache/php-8.1.34.tar.gz -O php-8.1.34/ext/session/session.c | grep -c 'rfc1867_enabled) || true'
+md5sum cache/php-8.1.34.tar.gz; cat custom_versions.txt; /usr/local/php81/bin/php81 -v | head -1
 ```
 
+De officiële laatste 8.1-release heet óók 8.1.34 (18 december 2025); de
+backport-branch is die release plus één commit van 18 oktober 2026 met de
+fixes voor beide CVE's ("Avoid state corruption via bailout", onder meer de
+nieuwe functie `zend_mm_safe_error_ex` en de upload-progress-route hard uit).
 `custom_versions.txt` wordt door `./build update` niet overschreven; haal het
-weer weg zodra je naar een ondersteunde versie migreert. Let op: CustomBuild
-kopieert tarballs naar `custombuild/cache/`; pak je een tarball opnieuw in,
-overschrijf dan ook de kopie daar en werk de md5 in `custom_versions.txt` bij.
+weer weg zodra je naar een ondersteunde versie migreert.
 
 Op dezelfde manier bouw je het officiële **8.3.36** van php.net als tweede
 PHP-versie (`php83:8.3.36:<md5>` plus `./build set php2_release 8.3`). Op
