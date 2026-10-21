@@ -45,6 +45,26 @@ mogen blijven sturen, bijvoorbeeld je kantoor of een monitoringsysteem. Geef
 **niet** 127.0.0.1 of het server-IP op: dan kan de zelftest de blokkade niet
 meer aantonen.
 
+## Ophalen vanaf GitHub (per server, zonder SFTP)
+
+Repository: https://github.com/plob881/php2shell-shield
+
+Alleen het script, rechtstreeks op de server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plob881/php2shell-shield/main/php2shell-shield.sh -o /root/php2shell-shield.sh && chmod 700 /root/php2shell-shield.sh && bash /root/php2shell-shield.sh install --dry-run --trust JOUW.KANTOOR.IP
+```
+
+De complete set als zip (laatste release):
+
+```bash
+curl -fsSL https://github.com/plob881/php2shell-shield/releases/latest/download/php2shell-shield.zip -o /root/php2shell-shield.zip && cd /root && unzip -o php2shell-shield.zip && bash php2shell-shield.sh install --dry-run --trust JOUW.KANTOOR.IP
+```
+
+Een nieuwere versie installeer je door dezelfde regel opnieuw te draaien met
+`install` (zonder `--dry-run`); het script kopieert zichzelf dan weer naar
+`/usr/local/sbin/php2shell-shield` en past de configuratie bij.
+
 ## Alle servers in één keer
 
 Zet je servers in `servers.txt` (zie `servers.txt.voorbeeld`) en draai vanuit
