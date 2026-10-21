@@ -241,7 +241,22 @@ tail -f /root/php81-build.log
 ```
 
 `custom_versions.txt` wordt door `./build update` niet overschreven; haal het
-weer weg zodra je naar een ondersteunde versie migreert. Dezelfde branches
+weer weg zodra je naar een ondersteunde versie migreert. Let op: CustomBuild
+kopieert tarballs naar `custombuild/cache/`; pak je een tarball opnieuw in,
+overschrijf dan ook de kopie daar en werk de md5 in `custom_versions.txt` bij.
+
+Op dezelfde manier bouw je het officiële **8.3.36** van php.net als tweede
+PHP-versie (`php83:8.3.36:<md5>` plus `./build set php2_release 8.3`). Op
+**CentOS 7** (OpenSSL 1.0.2) faalt 8.3.35+ in `ext/openssl/xp_ssl.c` op
+`ASN1_STRING_get0_data`; voeg vóór het bouwen deze compatibiliteitsregel toe
+aan de bron in de tarball (PHP 8.3 ondersteunt OpenSSL 1.0.2 officieel nog,
+alleen de nieuwe SAN-controle mist de shim):
+
+```c
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+#define ASN1_STRING_get0_data(x) ASN1_STRING_data(x)
+#endif
+``` Dezelfde branches
 bestaan voor 7.4 en 8.0, maar die melden geen nieuw versienummer, dus daar
 kun je het resultaat niet aan `php -v` aflezen.
 
