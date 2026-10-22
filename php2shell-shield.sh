@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.9"
+VERSION="1.2.10"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -297,7 +297,7 @@ trust_file_remove() {
     if grep -qxF "$c" "$TRUST_FILE"; then
       tmp=$(mktemp); grep -vxF "$c" "$TRUST_FILE" > "$tmp"; cat "$tmp" > "$TRUST_FILE"; rm -f "$tmp"; removed=0
     else
-      warn "$c staat niet in $TRUST_FILE$(printf '%s' "$TRUST" | grep -q . && printf ' (staat het in de bij install opgegeven --trust? draai dan install opnieuw met een nieuwe --trust)')"
+      warn "$c staat niet in $TRUST_FILE$([ -n "$TRUST" ] && printf ' (staat het in de bij install opgegeven --trust? draai dan install opnieuw met een nieuwe --trust)')"
     fi
   done
   return $removed
@@ -579,7 +579,7 @@ apache_install_global() {
     fi
     [ "$DRY_RUN" = 1 ] && { ok_variant="$variant"; break; }
     out=$(apache_configtest)
-    if printf '%s' "$out" | grep -qi 'syntax ok'; then ok_variant="$variant"; break; fi
+    if grep -qi 'syntax ok' <<< "$out"; then ok_variant="$variant"; break; fi
     warn "Apache-configtest faalde met variant '$variant':"; printf '%s\n' "$out" | sed 's/^/      /' >&2
   done
   if [ -z "$ok_variant" ]; then
@@ -668,7 +668,7 @@ nginx_install() {
     esac
     [ "$DRY_RUN" = 1 ] && { hook_ok="$hook"; break; }
     out=$(nginx_configtest)
-    if printf '%s' "$out" | grep -qi 'syntax is ok'; then hook_ok="$hook"; break; fi
+    if grep -qi 'syntax is ok' <<< "$out"; then hook_ok="$hook"; break; fi
     warn "nginx-configtest faalde met haak $hook; probeer volgende:"; printf '%s\n' "$out" | sed 's/^/      /' >&2
     nginx_http_hook_remove
   done
@@ -709,7 +709,7 @@ nginx_install() {
 
   if [ "$DRY_RUN" = 0 ] && [ "$NEED_PLESK_RECONFIGURE" = 0 ] && [ "$NEED_DA_REWRITE" = 0 ]; then
     out=$(nginx_configtest)
-    if ! printf '%s' "$out" | grep -qi 'syntax is ok'; then
+    if ! grep -qi 'syntax is ok' <<< "$out"; then
       err "nginx-configtest faalde; nginx-wijzigingen worden teruggedraaid:"; printf '%s\n' "$out" | sed 's/^/      /' >&2
       nginx_remove; return 1
     fi
@@ -772,10 +772,12 @@ da_rewrite_confs() {
 }
 
 # configtest_ok FUNCTIE PATROON [POGINGEN] : herhaal de configtest (standaard 5x, 3 s pauze)
+# Let op: geen 'cmd | grep -q' met pipefail: grep -q stopt bij de eerste treffer, een trage
+# nginx -t (honderden domeinen) krijgt dan EPIPE en de pipeline "faalt" terwijl de test slaagde.
 configtest_ok() {
-  local n=0 max="${3:-5}"
+  local n=0 max="${3:-5}" out
   while [ $n -lt "$max" ]; do
-    "$1" 2>&1 | grep -qi "$2" && return 0
+    out=$("$1" 2>&1) && grep -qi "$2" <<< "$out" && return 0
     n=$((n+1)); sleep 3
   done
   return 1
@@ -785,10 +787,9 @@ configtest_ok() {
 # include-bestanden? Zolang dat zo is, mogen die bestanden niet weg (anders start nginx/Apache niet)
 shield_refs_remaining() {
   local f
-  if [ "$HAVE_NGINX" = 1 ] && ( ulimit -n 65536 2>/dev/null; nginx -T 2>/dev/null ) | grep -q 'php2shell-shield/nginx-'; then return 0; fi
+  if [ "$HAVE_NGINX" = 1 ] && grep -q 'php2shell-shield/nginx-' <<< "$( (ulimit -n 65536 2>/dev/null; nginx -T 2>/dev/null) )"; then return 0; fi
   if [ "$HAVE_APACHE" = 1 ]; then
-    { case "$APACHE_BIN" in apache2) apache2ctl -t -D DUMP_INCLUDES ;; *) httpd -t -D DUMP_INCLUDES ;; esac; } 2>/dev/null \
-      | grep -q 'php2shell-shield/apache-' && return 0
+    grep -q 'php2shell-shield/apache-' <<< "$({ case "$APACHE_BIN" in apache2) apache2ctl -t -D DUMP_INCLUDES ;; *) httpd -t -D DUMP_INCLUDES ;; esac; } 2>/dev/null)" && return 0
   fi
   for f in /usr/local/directadmin/data/users/*/nginx.conf /usr/local/directadmin/data/users/*/httpd.conf \
            /etc/nginx/plesk.conf.d/vhosts/*.conf /etc/httpd/conf/plesk.conf.d/vhosts/*.conf /etc/apache2/plesk.conf.d/vhosts/*.conf; do
@@ -804,7 +805,7 @@ wait_no_shield_refs() {   # tot 2 minuten wachten tot DirectAdmin/Plesk klaar is
 # verwijst een gegenereerd server-blok nog naar onze server-include? (de http-include telt niet mee)
 server_refs_remaining() {
   local f
-  if [ "$HAVE_NGINX" = 1 ] && ( ulimit -n 65536 2>/dev/null; nginx -T 2>/dev/null ) | grep -q 'php2shell-shield/nginx-server'; then return 0; fi
+  if [ "$HAVE_NGINX" = 1 ] && grep -q 'php2shell-shield/nginx-server' <<< "$( (ulimit -n 65536 2>/dev/null; nginx -T 2>/dev/null) )"; then return 0; fi
   for f in /usr/local/directadmin/data/users/*/nginx.conf /etc/nginx/plesk.conf.d/vhosts/*.conf; do
     [ -f "$f" ] && grep -q 'php2shell-shield' "$f" && return 0
   done
@@ -981,7 +982,7 @@ php_reload_all() {
 # "Avoid state corruption via bailout" voor 7.4, 8.0 en 8.1)? ZEND_API, dus zichtbaar via nm -D
 has_backport_symbol() {
   local b="$1"
-  if command -v nm >/dev/null 2>&1 && nm -D "$b" 2>/dev/null | grep -q zend_mm_safe_error_ex; then return 0; fi
+  if command -v nm >/dev/null 2>&1 && grep -q zend_mm_safe_error_ex <<< "$(nm -D "$b" 2>/dev/null)"; then return 0; fi
   grep -aq zend_mm_safe_error_ex "$b" 2>/dev/null   # werkt ook zonder binutils
 }
 
@@ -1301,9 +1302,9 @@ do_probe() {
   done
   for d in $docroots; do rm -f "$d/$name"; done
   say "  probe $dom: ${out:-geen antwoord}"
-  if printf '%s' "$out" | grep -q "upload_progress=''\|upload_progress='0'\|upload_progress=false"; then
+  if grep -q "upload_progress=''\|upload_progress='0'\|upload_progress=false" <<< "$out"; then
     ok "upload_progress staat effectief UIT voor $dom"
-  elif printf '%s' "$out" | grep -q "upload_progress="; then
+  elif grep -q "upload_progress=" <<< "$out"; then
     warn "upload_progress staat nog AAN voor $dom (per-domein php.ini/.user.ini? handler nog niet herladen?)"
   else
     warn "probe kwam niet bij PHP van $dom uit (antwoord: ${out:-leeg}); controleer of de docroot afwijkt van de standaard"
@@ -1325,9 +1326,9 @@ do_scan() {
     done
   fi
   if [ "$HAVE_APACHE" = 1 ]; then
-    { case "$APACHE_BIN" in apache2) apache2ctl -M ;; *) httpd -M ;; esac; } 2>/dev/null | grep -qiE 'php[0-9]*_module' && warn "Apache heeft mod_php geladen (hoogste risico volgens PHP: RCE bewezen bij standaardlimieten)"
+    grep -qiE 'php[0-9]*_module' <<< "$({ case "$APACHE_BIN" in apache2) apache2ctl -M ;; *) httpd -M ;; esac; } 2>/dev/null)" && warn "Apache heeft mod_php geladen (hoogste risico volgens PHP: RCE bewezen bij standaardlimieten)"
   fi
-  if [ "$PANEL" = plesk ] && plesk bin php_handler --list 2>/dev/null | grep -qiE 'module'; then
+  if [ "$PANEL" = plesk ] && grep -qiE 'module' <<< "$(plesk bin php_handler --list 2>/dev/null)"; then
     warn "Plesk: er bestaat een 'Apache module' (mod_php) PHP-handler; controleer welke domeinen die gebruiken en zet ze op FPM"
   fi
   pv=$(grep -rlsE 'PHP_(ADMIN_)?VALUE' /etc/nginx /etc/httpd /etc/apache2 /usr/local/directadmin/data/users 2>/dev/null | head -5)
