@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.11"
+VERSION="1.2.12"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -1229,7 +1229,7 @@ listen_ports() {   # poorten van apache/nginx/lsws, zonder paneel-/adminpoorten
 }
 
 do_test() {
-  local hosts h p scheme ip code_get code_mp fails=0 total=0 ips port_list resolve out effhost via
+  local hosts h p scheme ip code_get code_mp fails=0 total=0 ips port_list resolve hdr srv effhost
   command -v curl >/dev/null 2>&1 || { warn "curl ontbreekt; test overgeslagen"; return 0; }
   hr; say "Zelftest: multipart-POST moet 403 geven, gewone GET niet (redirects worden gevolgd, op de server zelf)"
   hosts=$(test_hosts | sort -u)
@@ -1246,27 +1246,24 @@ do_test() {
         # multipart-POST zónder redirects volgen: een 3xx komt dan van de webserver zelf (Redirect/
         # RewriteRule vóór de toegangscontrole), dus PHP heeft de body nooit gezien; de bestemming
         # krijgt bij een eigen verzoek weer de blokkade. Een 2xx is wél een echt gat.
-        out=$(curl -sk -o /dev/null -m 10 $resolve -w '%{http_code} %{redirect_url}' \
-                  -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || out="000 -"
-        code_mp="${out%% *}"; effhost=$(printf '%s' "${out#* }" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
-        via=""
-        # 405/404 op /: nginx serveerde zelf een statisch bestand (of er staat niets), dus PHP was
-        # niet in beeld; test dan via een PHP-pad, dat gaat naar de PHP-afhandeling (of de proxy naar Apache)
-        if [ "$MODE" = strict ] && [[ "$code_mp" =~ ^40[45]$ ]]; then
-          out=$(curl -sk -o /dev/null -m 10 $resolve -w '%{http_code} %{redirect_url}' \
-                    -F "php2shell_shield_test=1" "$scheme://$h:$p/index.php" 2>/dev/null) || out="000 -"
-          code_mp="${out%% *}"; effhost=$(printf '%s' "${out#* }" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
-          via="  (/ is statisch, getest op /index.php)"
-        fi
+        # headers meenemen: de Server-header verraadt of nginx het verzoek zelf (statisch) afhandelde
+        hdr=$(curl -sk -m 10 $resolve -D - -o /dev/null -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || hdr=""
+        code_mp=$(printf '%s\n' "$hdr" | awk 'toupper($1) ~ /^HTTP\// {c=$2} END{printf "%03d", c+0}')
+        srv=$(printf '%s\n' "$hdr" | awk -F': *' 'tolower($1)=="server" {s=$2} END{print s}' | tr -d '\r')
+        effhost=$(printf '%s\n' "$hdr" | awk -F': *' 'tolower($1)=="location" {l=$2} END{print l}' | tr -d '\r' | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
         total=$((total+1))
         if [ "$MODE" = strict ] && [ "$code_mp" != 403 ] && [[ "$code_mp" =~ ^30[12378]$ ]]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  (redirect door de webserver vóór PHP, naar %s)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "${effhost:-?}" "$C_OFF"
+        elif [ "$MODE" = strict ] && { [ "$code_mp" = 405 ] || { [ "$code_mp" = 404 ] && [ "$HAVE_APACHE" = 1 ] && [ "$HAVE_NGINX" = 1 ] && [[ "$srv" =~ ^[Nn]ginx ]]; }; }; then
+          # 405 = nginx weigert POST op een statisch bestand; 404 van nginx vóór Apache = statisch bestand:
+          # PHP was niet in beeld. PHP-paden op zo'n vhost (bv. /roundcube/) lopen via de proxy en worden wél geblokkeerd.
+          printf '  %s%-34s %-5s GET=%s multipart=%s  (statisch door %s, geen PHP; PHP-paden lopen via de proxy)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "${srv:-nginx}" "$C_OFF"
         elif [ "$MODE" = strict ] && [ "$code_mp" != 403 ]; then
-          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$via" "$C_OFF"; fails=$((fails+1))
+          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"; fails=$((fails+1))
         elif [ "$code_get" = 403 ]; then
-          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- GET geeft ook 403 (controleer!)%s%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$via" "$C_OFF"
+          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- GET geeft ook 403 (controleer!)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"
         else
-          printf '  %-34s %-5s GET=%s multipart=%s%s\n' "$h" "$p" "$code_get" "$code_mp" "$via"
+          printf '  %-34s %-5s GET=%s multipart=%s\n' "$h" "$p" "$code_get" "$code_mp"
         fi
         break   # eerste bereikbare IP per host/poort volstaat
       done
