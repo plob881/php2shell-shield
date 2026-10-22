@@ -1249,8 +1249,8 @@ do_test() {
         # headers meenemen: de Server-header verraadt of nginx het verzoek zelf (statisch) afhandelde
         hdr=$(curl -sk -m 10 $resolve -D - -o /dev/null -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || hdr=""
         code_mp=$(printf '%s\n' "$hdr" | awk 'toupper($1) ~ /^HTTP\// {c=$2} END{printf "%03d", c+0}')
-        srv=$(printf '%s\n' "$hdr" | awk -F': *' 'tolower($1)=="server" {s=$2} END{print s}' | tr -d '\r')
-        effhost=$(printf '%s\n' "$hdr" | awk -F': *' 'tolower($1)=="location" {l=$2} END{print l}' | tr -d '\r' | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
+        srv=$(printf '%s\n' "$hdr" | awk 'tolower($1)=="server:" {sub(/^[^:]*: */,""); s=$0} END{print s}' | tr -d '\r')
+        effhost=$(printf '%s\n' "$hdr" | awk 'tolower($1)=="location:" {sub(/^[^:]*: */,""); l=$0} END{print l}' | tr -d '\r' | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
         total=$((total+1))
         if [ "$MODE" = strict ] && [ "$code_mp" != 403 ] && [[ "$code_mp" =~ ^30[12378]$ ]]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  (redirect door de webserver vóór PHP, naar %s)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "${effhost:-?}" "$C_OFF"
