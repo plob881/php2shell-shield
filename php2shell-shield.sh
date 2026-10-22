@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.7"
+VERSION="1.2.8"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -529,11 +529,13 @@ nginx_server_conf() {
 # =============================================================================
 #  Apache
 # =============================================================================
+# configtests openen bij honderden domeinen alle logbestanden: limiet voor open bestanden verhogen
 apache_configtest() {
-  case "$APACHE_BIN" in
-    apache2) apache2ctl configtest 2>&1 ;;
-    *)       httpd -t 2>&1 ;;
-  esac
+  ( ulimit -n 65536 2>/dev/null
+    case "$APACHE_BIN" in
+      apache2) apache2ctl configtest 2>&1 ;;
+      *)       httpd -t 2>&1 ;;
+    esac )
 }
 apache_reload() {
   [ "$DRY_RUN" = 1 ] && { say "  [dry-run] apache herladen"; return 0; }
@@ -631,7 +633,7 @@ apache_remove_vhost_level() {
 # =============================================================================
 #  nginx
 # =============================================================================
-nginx_configtest() { nginx -t 2>&1; }
+nginx_configtest() { ( ulimit -n 65536 2>/dev/null; nginx -t 2>&1 ); }
 nginx_reload() {
   [ "$DRY_RUN" = 1 ] && { say "  [dry-run] nginx herladen"; return 0; }
   if [ "$HAVE_SYSTEMD" = 1 ]; then systemctl reload-or-restart nginx 2>/dev/null && return 0; fi
@@ -779,7 +781,7 @@ configtest_ok() {
 # include-bestanden? Zolang dat zo is, mogen die bestanden niet weg (anders start nginx/Apache niet)
 shield_refs_remaining() {
   local f
-  if [ "$HAVE_NGINX" = 1 ] && nginx -T 2>/dev/null | grep -q 'php2shell-shield/nginx-'; then return 0; fi
+  if [ "$HAVE_NGINX" = 1 ] && ( ulimit -n 65536 2>/dev/null; nginx -T 2>/dev/null ) | grep -q 'php2shell-shield/nginx-'; then return 0; fi
   if [ "$HAVE_APACHE" = 1 ]; then
     { case "$APACHE_BIN" in apache2) apache2ctl -t -D DUMP_INCLUDES ;; *) httpd -t -D DUMP_INCLUDES ;; esac; } 2>/dev/null \
       | grep -q 'php2shell-shield/apache-' && return 0
