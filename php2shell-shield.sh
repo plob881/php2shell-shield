@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.10"
+VERSION="1.2.11"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -1229,7 +1229,7 @@ listen_ports() {   # poorten van apache/nginx/lsws, zonder paneel-/adminpoorten
 }
 
 do_test() {
-  local hosts h p scheme ip code_get code_mp fails=0 total=0 ips port_list resolve out effhost
+  local hosts h p scheme ip code_get code_mp fails=0 total=0 ips port_list resolve out effhost via
   command -v curl >/dev/null 2>&1 || { warn "curl ontbreekt; test overgeslagen"; return 0; }
   hr; say "Zelftest: multipart-POST moet 403 geven, gewone GET niet (redirects worden gevolgd, op de server zelf)"
   hosts=$(test_hosts | sort -u)
@@ -1249,15 +1249,24 @@ do_test() {
         out=$(curl -sk -o /dev/null -m 10 $resolve -w '%{http_code} %{redirect_url}' \
                   -F "php2shell_shield_test=1" "$scheme://$h:$p/" 2>/dev/null) || out="000 -"
         code_mp="${out%% *}"; effhost=$(printf '%s' "${out#* }" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
+        via=""
+        # 405/404 op /: nginx serveerde zelf een statisch bestand (of er staat niets), dus PHP was
+        # niet in beeld; test dan via een PHP-pad, dat gaat naar de PHP-afhandeling (of de proxy naar Apache)
+        if [ "$MODE" = strict ] && [[ "$code_mp" =~ ^40[45]$ ]]; then
+          out=$(curl -sk -o /dev/null -m 10 $resolve -w '%{http_code} %{redirect_url}' \
+                    -F "php2shell_shield_test=1" "$scheme://$h:$p/index.php" 2>/dev/null) || out="000 -"
+          code_mp="${out%% *}"; effhost=$(printf '%s' "${out#* }" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
+          via="  (/ is statisch, getest op /index.php)"
+        fi
         total=$((total+1))
         if [ "$MODE" = strict ] && [ "$code_mp" != 403 ] && [[ "$code_mp" =~ ^30[12378]$ ]]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  (redirect door de webserver vóór PHP, naar %s)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "${effhost:-?}" "$C_OFF"
         elif [ "$MODE" = strict ] && [ "$code_mp" != 403 ]; then
-          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"; fails=$((fails+1))
+          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$via" "$C_OFF"; fails=$((fails+1))
         elif [ "$code_get" = 403 ]; then
-          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- GET geeft ook 403 (controleer!)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"
+          printf '  %s%-34s %-5s GET=%s multipart=%s  <-- GET geeft ook 403 (controleer!)%s%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$via" "$C_OFF"
         else
-          printf '  %-34s %-5s GET=%s multipart=%s\n' "$h" "$p" "$code_get" "$code_mp"
+          printf '  %-34s %-5s GET=%s multipart=%s%s\n' "$h" "$p" "$code_get" "$code_mp" "$via"
         fi
         break   # eerste bereikbare IP per host/poort volstaat
       done
