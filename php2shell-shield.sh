@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.8"
+VERSION="1.2.9"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -717,9 +717,12 @@ nginx_install() {
   return 0
 }
 
-nginx_remove() {
+# server-context haken weg (DA-token, Plesk-vhosts, server-includes, kale server-regels). De
+# http-context include met de variabelen blijft hier staan: zolang DirectAdmin/Plesk nog
+# server-blokken met onze server-include aan het herschrijven is, zou de config zonder die
+# variabelen ongeldig zijn ("unknown php2shell_block variable") en weigert nginx -t.
+nginx_remove_server() {
   local d f
-  nginx_http_hook_remove
   [ -e /etc/nginx/conf.d/server-includes/php2shell-shield.conf ] && { run rm -f /etc/nginx/conf.d/server-includes/php2shell-shield.conf; CHANGED_NGINX=1; }
   [ -f /usr/local/directadmin/data/templates/custom/cust_nginx.CUSTOM.post ] && remove_block /usr/local/directadmin/data/templates/custom/cust_nginx.CUSTOM.post && { CHANGED_DA=1; NEED_DA_REWRITE=1; }
   for d in /var/www/vhosts/system/*/conf; do
@@ -732,6 +735,7 @@ nginx_remove() {
     backup_file "$f"; sed -i '/# php2shell-shield$/d' "$f"; CHANGED_NGINX=1
   done
 }
+nginx_remove() { nginx_remove_server; nginx_http_hook_remove; }
 
 # =============================================================================
 #  OpenLiteSpeed / LiteSpeed (DirectAdmin)
@@ -796,6 +800,36 @@ wait_no_shield_refs() {   # tot 2 minuten wachten tot DirectAdmin/Plesk klaar is
   local i=0
   while shield_refs_remaining && [ $i -lt 40 ]; do sleep 3; i=$((i+1)); done
   ! shield_refs_remaining
+}
+# verwijst een gegenereerd server-blok nog naar onze server-include? (de http-include telt niet mee)
+server_refs_remaining() {
+  local f
+  if [ "$HAVE_NGINX" = 1 ] && ( ulimit -n 65536 2>/dev/null; nginx -T 2>/dev/null ) | grep -q 'php2shell-shield/nginx-server'; then return 0; fi
+  for f in /usr/local/directadmin/data/users/*/nginx.conf /etc/nginx/plesk.conf.d/vhosts/*.conf; do
+    [ -f "$f" ] && grep -q 'php2shell-shield' "$f" && return 0
+  done
+  return 1
+}
+wait_no_server_refs() {   # tot 10 minuten wachten tot DirectAdmin/Plesk alle server-blokken herschreven heeft
+  local i=0
+  while server_refs_remaining && [ $i -lt 200 ]; do sleep 3; i=$((i+1)); done
+  ! server_refs_remaining
+}
+# install: wachten (max 3 min) tot DirectAdmin elke user-nginx.conf met een listen-regel onze
+# server-include gegeven heeft; anders test, herlaad en zelftest je een half herschreven config
+da_wait_nginx_installed() {
+  local i=0 files total=0 have=0
+  [ "$PANEL" = directadmin ] && [ "$HAVE_NGINX" = 1 ] || return 0
+  grep -qs 'php2shell-shield/nginx-server.conf' /usr/local/directadmin/data/templates/custom/cust_nginx.CUSTOM.post || return 0
+  files=$(ls /usr/local/directadmin/data/users/*/nginx.conf 2>/dev/null); [ -n "$files" ] || return 0
+  while [ $i -lt 60 ]; do
+    total=$(grep -lE '^[[:space:]]*listen' $files 2>/dev/null | wc -l)
+    have=$(grep -lE '^[[:space:]]*listen' $files 2>/dev/null | xargs -r grep -l 'php2shell-shield/nginx-server.conf' 2>/dev/null | wc -l)
+    [ "$have" -ge "$total" ] && return 0
+    sleep 3; i=$((i+1))
+  done
+  warn "DirectAdmin heeft na 3 min nog niet alle nginx-configs herschreven ($have van $total); controleer straks met: php2shell-shield status"
+  return 0
 }
 plesk_mark_domain() {   # $1 = /var/www/vhosts/system/DOMEIN/conf
   local dom; dom=$(basename "$(dirname "$1")")
@@ -1416,6 +1450,7 @@ apply_all() {
 
   # --- herschrijven en herladen ---
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
+  [ "$NEED_DA_REWRITE" = 1 ] && [ "$MODE" != signature ] && da_wait_nginx_installed
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
   # DirectAdmin 1.7x en Plesk herschrijven asynchroon: tot 2 minuten wachten op een geldige config
   { [ "$NEED_DA_REWRITE" = 1 ] || [ "$NEED_PLESK_RECONFIGURE" = 1 ]; } && tries=40
@@ -1501,11 +1536,16 @@ do_uninstall() {
   need_root; detect_env; load_state || true
   print_env
   info "Webserver-haken verwijderen..."
-  apache_remove_global; apache_remove_vhost_level; nginx_remove; ols_remove
+  apache_remove_global; apache_remove_vhost_level; nginx_remove_server; ols_remove
   remove_watch; remove_firewall_sets
   [ -f /etc/logrotate.d/php2shell-shield ] && run rm -f /etc/logrotate.d/php2shell-shield
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
+  # de http-context include (variabelen) mag pas weg als geen server-blok de server-include meer gebruikt
+  if [ "$HAVE_NGINX" = 1 ]; then
+    if [ "$DRY_RUN" = 1 ] || wait_no_server_refs; then nginx_http_hook_remove
+    else err "Na 10 min verwijzen gegenereerde server-blokken nog naar $SHIELD_DIR/nginx-server.conf; de http-include blijft staan. Draai straks: php2shell-shield cleanup"; fi
+  fi
   if [ "$RESTORE_PHP_INI" = 1 ]; then info "php.ini's herstellen uit backup..."; php_restore; else say "php.ini-hardening (upload_progress=Off) blijft staan; gebruik --restore-php-ini om ook dat terug te draaien."; fi
   if [ "$HAVE_APACHE" = 1 ]; then configtest_ok apache_configtest 'syntax ok' 40 && apache_reload && ok "Apache herladen" || err "Apache-configtest faalt; controleer $APACHE_BIN -t"; fi
   if [ "$HAVE_NGINX" = 1 ]; then configtest_ok nginx_configtest 'syntax is ok' 40 && nginx_reload && ok "nginx herladen" || err "nginx-configtest faalt; controleer nginx -t"; fi
@@ -1522,6 +1562,12 @@ do_uninstall() {
 # nog naar verwijst; anders leegmaken en laten staan (een lege include is geldig)
 do_cleanup() {
   local f
+  # http-include nog aanwezig (uninstall liep tegen de wachttijd aan)? Weg zodra geen server-blok meer meedoet
+  if [ "$HAVE_NGINX" = 1 ] && [ "$DRY_RUN" = 0 ] && ! server_refs_remaining \
+     && { grep -qs 'php2shell-shield/nginx-http.conf' /etc/nginx/nginx-includes.conf || [ -e /etc/nginx/conf.d/zz-php2shell-shield.conf ]; }; then
+    nginx_http_hook_remove
+    configtest_ok nginx_configtest 'syntax is ok' 5 && nginx_reload && ok "nginx: http-include verwijderd en herladen" || err "nginx-configtest faalt; controleer nginx -t"
+  fi
   if wait_no_shield_refs; then
     rm -f "$SHIELD_DIR"/apache-server.conf "$SHIELD_DIR"/apache-vhost.conf "$SHIELD_DIR"/nginx-http.conf "$SHIELD_DIR"/nginx-server.conf
     rm -f "$BIN_TARGET"
