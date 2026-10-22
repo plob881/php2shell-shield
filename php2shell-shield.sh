@@ -46,7 +46,7 @@
 #                regels op het bekende aanvalspatroon (waar ModSecurity draait)
 # =============================================================================
 
-VERSION="1.2.12"
+VERSION="1.2.13"
 SHIELD_DIR="/etc/php2shell-shield"
 STATE_FILE="$SHIELD_DIR/state.conf"
 TRUST_FILE="$SHIELD_DIR/trust.txt"     # één IP of IP/CIDR per regel, # = commentaar
@@ -1546,6 +1546,9 @@ do_uninstall() {
   apache_remove_global; apache_remove_vhost_level; nginx_remove_server; ols_remove
   remove_watch; remove_firewall_sets
   [ -f /etc/logrotate.d/php2shell-shield ] && run rm -f /etc/logrotate.d/php2shell-shield
+  # tokens al eerder weggehaald (oudere uninstall), maar gegenereerde configs verwijzen nog? dan tóch herschrijven
+  if [ "$PANEL" = directadmin ] && grep -qs php2shell-shield /usr/local/directadmin/data/users/*/nginx.conf /usr/local/directadmin/data/users/*/httpd.conf 2>/dev/null; then NEED_DA_REWRITE=1; fi
+  if [ "$PANEL" = plesk ] && grep -qs php2shell-shield /etc/nginx/plesk.conf.d/vhosts/*.conf /etc/httpd/conf/plesk.conf.d/vhosts/*.conf /etc/apache2/plesk.conf.d/vhosts/*.conf 2>/dev/null; then NEED_PLESK_RECONFIGURE=1; fi
   [ "$NEED_DA_REWRITE" = 1 ] && da_rewrite_confs
   [ "$NEED_PLESK_RECONFIGURE" = 1 ] && plesk_reconfigure_all
   # de http-context include (variabelen) mag pas weg als geen server-blok de server-include meer gebruikt
@@ -1569,6 +1572,12 @@ do_uninstall() {
 # nog naar verwijst; anders leegmaken en laten staan (een lege include is geldig)
 do_cleanup() {
   local f
+  # gegenereerde DirectAdmin-configs verwijzen nog naar ons terwijl de tokens al weg zijn: herschrijven
+  if [ "$PANEL" = directadmin ] && [ "$DRY_RUN" = 0 ] \
+     && grep -qs php2shell-shield /usr/local/directadmin/data/users/*/nginx.conf /usr/local/directadmin/data/users/*/httpd.conf 2>/dev/null \
+     && ! grep -qs php2shell-shield /usr/local/directadmin/data/templates/custom/cust_nginx.CUSTOM.post /usr/local/directadmin/data/templates/custom/cust_httpd.CUSTOM.1.pre 2>/dev/null; then
+    da_rewrite_confs
+  fi
   # http-include nog aanwezig (uninstall liep tegen de wachttijd aan)? Weg zodra geen server-blok meer meedoet
   if [ "$HAVE_NGINX" = 1 ] && [ "$DRY_RUN" = 0 ] && ! server_refs_remaining \
      && { grep -qs 'php2shell-shield/nginx-http.conf' /etc/nginx/nginx-includes.conf || [ -e /etc/nginx/conf.d/zz-php2shell-shield.conf ]; }; then
