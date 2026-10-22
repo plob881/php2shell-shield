@@ -365,6 +365,11 @@ Voor elke wijziging wordt `httpd -t` / `nginx -t` gedraaid; faalt dat, dan wordt
 de wijziging teruggedraaid en niets herladen. `uninstall` verwijdert de haken,
 de service, de firewallsets en de logrotate-regel, en laat de backups staan.
 
+Bij servers met honderden domeinen opent `nginx -t` alle logbestanden tegelijk en
+faalt dan vanuit een gewone shell op `Too many open files` (de draaiende nginx heeft
+via systemd een hogere limiet en werkt gewoon). Het script verhoogt de limiet zelf
+sinds v1.2.8; test je met de hand, doe dan `ulimit -n 65536; nginx -t`.
+
 ## Kanttekeningen die je moet kennen
 
 - **Geen volledige garantie.** PHP's advisory noemt het blokkeren van multipart
