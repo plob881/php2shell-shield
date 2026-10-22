@@ -1257,7 +1257,7 @@ do_test() {
         elif [ "$MODE" = strict ] && { [ "$code_mp" = 405 ] || { [ "$code_mp" = 404 ] && [ "$HAVE_APACHE" = 1 ] && [ "$HAVE_NGINX" = 1 ] && [[ "$srv" =~ ^[Nn]ginx ]]; }; }; then
           # 405 = nginx weigert POST op een statisch bestand; 404 van nginx vóór Apache = statisch bestand:
           # PHP was niet in beeld. PHP-paden op zo'n vhost (bv. /roundcube/) lopen via de proxy en worden wél geblokkeerd.
-          printf '  %s%-34s %-5s GET=%s multipart=%s  (statisch door %s, geen PHP; PHP-paden lopen via de proxy)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "${srv:-nginx}" "$C_OFF"
+          printf '  %s%-34s %-5s GET=%s multipart=%s  (statisch bestand, geen PHP in beeld; zeker weten: php2shell-shield test --probe %s)%s\n' "$C_YEL" "$h" "$p" "$code_get" "$code_mp" "$h" "$C_OFF"
         elif [ "$MODE" = strict ] && [ "$code_mp" != 403 ]; then
           printf '  %s%-34s %-5s GET=%s multipart=%s  <-- NIET geblokkeerd%s\n' "$C_RED" "$h" "$p" "$code_get" "$code_mp" "$C_OFF"; fails=$((fails+1))
         elif [ "$code_get" = 403 ]; then
