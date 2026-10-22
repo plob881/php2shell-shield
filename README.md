@@ -230,6 +230,35 @@ Staat er voor jouw versie 1 of meer, dan is `./build php_expert 7.4 php-fpm`
 patch zelf toe. Alleen op servers met een bevroren versielijst (legacy-licentie)
 blijft de route hieronder nodig.
 
+### Past CustomBuild de patches niet toe? `tools/da-php-rebuild.sh`
+
+Op een oude CustomBuild 2.0.0 (legacy-licentie; `grep -c patch_dir_apply build`
+geeft 0) staan de patches wél in `patches/php-<versie>/`, maar bouwt
+`./build php n` kale PHP zonder ze toe te passen. Op CentOS 6 weigert `./build`
+helemaal. Het script `tools/da-php-rebuild.sh` doet dan buiten CustomBuild om
+precies wat CustomBuild zou doen: configure-regel uit `php -i`, tarball uit
+`custombuild/cache` (of php.net), alle DA-patches op volgorde met `patch -p1`,
+`./configure && make`; en als aparte stap `--install`: backup, `make install`,
+php-fpm of Apache herstarten en een nm-check op het backport-symbool. Bouwen
+installeert niets, dus dat kan veilig terwijl de shield aanstaat.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/plob881/php2shell-shield/main/tools/da-php-rebuild.sh -o /root/da-php-rebuild.sh && mkdir -p /root/phpbuild && nohup bash /root/da-php-rebuild.sh 7.4 5.6 > /root/phpbuild/rebuild.log 2>&1 &
+```
+
+Volg `/root/phpbuild/rebuild.log` tot "ALLES GEBOUWD" (op 8 cores ongeveer 4
+minuten per versie), controleer dat elke versie "CVE-2026-109618-fix in de bron:
+1 regel(s)" of meer meldt, en installeer dan:
+
+```bash
+bash /root/da-php-rebuild.sh --install 7.4 5.6
+```
+
+Daarna moet `php2shell-shield status` per binary "OK (backport, symbool
+aanwezig)" geven; pas dan `php2shell-shield uninstall`. Dezelfde stappen zijn
+met de hand gedaan op CentOS 6 (7.2 en 5.6, suphp en mod_php); let daar op dat
+`make install` bij mod_php de httpd.conf aanpast (het script zet hem terug).
+
 ### PHP 8.1 zelf patchen met de officiële backport (DirectAdmin CustomBuild)
 
 Krijgt je server geen gepatchte 8.1 van DirectAdmin (bijvoorbeeld een legacy-
